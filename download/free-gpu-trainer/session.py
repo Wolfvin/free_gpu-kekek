@@ -1,15 +1,32 @@
-"""Session manager: handles rotation, cooldowns, and scheduling across accounts."""
+"""Session manager: handles rotation, cooldowns, and scheduling across accounts.
+
+Key design decisions:
+  - Sessions start in PENDING state — timer doesn't count down until confirmed
+  - Auto-platforms (Kaggle API, SSH) are auto-confirmed after push_code succeeds
+  - Manual platforms (Colab, notebooks) require /confirm from user
+  - check_status() is polled periodically to detect real platform state
+  - If check_status() reports stopped while session is active, session ends
+"""
 
 import time
 import threading
 import logging
 from typing import Optional, Callable
+from enum import Enum
 
 from platforms import (
     PlatformConfig, AccountConfig, PlatformStatus,
 )
 
 logger = logging.getLogger("free-gpu-trainer")
+
+
+class SessionPhase(Enum):
+    """Lifecycle phases of a session."""
+    PENDING = "pending"       # Created but not yet confirmed running on platform
+    CONFIRMED = "confirmed"   # Training confirmed running — timer counting down
+    EXPIRED = "expired"       # Session time limit reached
+    ENDED = "ended"           # Session manually ended or platform reported stopped
 
 
 class Session:
@@ -19,39 +36,97 @@ class Session:
                  on_expire: Optional[Callable] = None):
         self.platform = platform
         self.account = account
-        self.started_at = time.time()
+        self._phase: SessionPhase = SessionPhase.PENDING
+        self._confirmed_at: Optional[float] = None  # When user confirmed training is running
         self.limit_seconds = platform.session_limit_hours * 3600
         self._on_expire = on_expire
         self._timer: Optional[threading.Timer] = None
+        self._rotation_timer: Optional[threading.Timer] = None
         self._active = True
+        self._last_status_check: Optional[str] = None  # Last known platform status
 
-        # Mark account as in use
+        # Mark account as in use (but phase is still PENDING)
         account.status = PlatformStatus.IN_USE
-        account.current_session_start = self.started_at
         account.sessions_used += 1
 
     @property
+    def phase(self) -> SessionPhase:
+        return self._phase
+
+    @property
+    def is_pending(self) -> bool:
+        """Session created but not yet confirmed as running on the platform."""
+        return self._phase == SessionPhase.PENDING
+
+    @property
+    def is_confirmed(self) -> bool:
+        """Training confirmed running — countdown is active."""
+        return self._phase == SessionPhase.CONFIRMED
+
+    def confirm(self):
+        """Confirm that training is actually running on the platform.
+
+        This starts the countdown timer. For auto-platforms, this is called
+        automatically after successful push_code. For manual platforms, user
+        must call /confirm.
+        """
+        if self._phase != SessionPhase.PENDING:
+            return
+        self._phase = SessionPhase.CONFIRMED
+        self._confirmed_at = time.time()
+        self.account.current_session_start = self._confirmed_at
+        logger.info(
+            f"Session confirmed: {self.platform.name}/{self.account.name} "
+            f"(limit: {self.platform.session_limit_hours}h)"
+        )
+
+    @property
     def elapsed_seconds(self) -> float:
-        return time.time() - self.started_at
+        """Seconds since confirmation (0 if still pending)."""
+        if self._confirmed_at is None:
+            return 0.0
+        return time.time() - self._confirmed_at
 
     @property
     def remaining_seconds(self) -> float:
+        """Seconds remaining before session limit (full limit if pending)."""
+        if self._confirmed_at is None:
+            return self.limit_seconds
         return max(0, self.limit_seconds - self.elapsed_seconds)
 
     @property
     def progress(self) -> float:
+        """Progress through session (0 if pending)."""
+        if self._confirmed_at is None:
+            return 0.0
         return min(1.0, self.elapsed_seconds / self.limit_seconds)
 
     @property
     def is_active(self) -> bool:
-        return self._active and self.remaining_seconds > 0
+        return self._active and self._phase in (SessionPhase.PENDING, SessionPhase.CONFIRMED)
+
+    def update_platform_status(self, status: str):
+        """Update the last known status from the platform's check_status()."""
+        self._last_status_check = status
+        # If platform reports training is stopped/complete while we think it's active,
+        # end the session
+        if self._phase == SessionPhase.CONFIRMED and status in ("stopped", "complete", "error"):
+            logger.warning(
+                f"Platform reports status '{status}' for "
+                f"{self.platform.name}/{self.account.name} — ending session"
+            )
+            self.end()
 
     def end(self):
         """Manually end this session."""
         self._active = False
+        self._phase = SessionPhase.ENDED
         if self._timer:
             self._timer.cancel()
             self._timer = None
+        if self._rotation_timer:
+            self._rotation_timer.cancel()
+            self._rotation_timer = None
         elapsed_h = self.elapsed_seconds / 3600
         self.account.total_hours_used += elapsed_h
         self.account.weekly_hours_used += elapsed_h
@@ -85,14 +160,21 @@ class Session:
 class SessionManager:
     """Manages sessions across all platforms with auto-rotation."""
 
+    # Platforms with real API push — can be auto-confirmed
+    AUTO_PLATFORMS = {"kaggle", "oracle_cloud", "gcp"}
+    # HuggingFace is semi-auto — push works but it's NOT for training
+    # Manual platforms need /confirm from user
+
     def __init__(self, platforms: list[PlatformConfig],
                  auto_rotate: bool = True,
                  rotate_buffer_minutes: int = 10,
-                 checkpoint_before_rotate: bool = True):
+                 checkpoint_before_rotate: bool = True,
+                 entry_script: str = "train.py"):
         self.platforms = platforms
         self.auto_rotate = auto_rotate
         self.rotate_buffer_seconds = rotate_buffer_minutes * 60
         self.checkpoint_before_rotate = checkpoint_before_rotate
+        self.entry_script = entry_script
         self.current_session: Optional[Session] = None
         self.session_history: list[dict] = []
         self._rotation_timer: Optional[threading.Timer] = None
@@ -103,6 +185,10 @@ class SessionManager:
     @property
     def is_training(self) -> bool:
         return self.current_session is not None and self.current_session.is_active
+
+    def is_auto_platform(self, platform_key: str) -> bool:
+        """Check if a platform can be auto-confirmed after push."""
+        return platform_key in self.AUTO_PLATFORMS
 
     def get_next_account(self) -> Optional[tuple[PlatformConfig, AccountConfig]]:
         """Find the next available account across all platforms.
@@ -133,7 +219,11 @@ class SessionManager:
         return None
 
     def start_session(self, on_rotate: Optional[Callable] = None) -> Optional[Session]:
-        """Start a new session on the next available account."""
+        """Start a new session on the next available account.
+
+        The session starts in PENDING state — it must be confirmed
+        (via confirm_session) before the countdown timer begins.
+        """
         self._on_rotate = on_rotate
         result = self.get_next_account()
         if not result:
@@ -146,20 +236,32 @@ class SessionManager:
             self.current_session = session
             self._running = True
 
-        # Set up auto-rotation timer
+        logger.info(
+            f"Session created (PENDING): {platform.name}/{account.name} "
+            f"(limit: {platform.session_limit_hours}h, GPU: {platform.gpu_type})"
+        )
+        return session
+
+    def confirm_session(self) -> bool:
+        """Confirm the current session is running on the platform.
+
+        Starts the countdown timer and sets up auto-rotation.
+        Returns True if confirmed, False if no active session.
+        """
+        if not self.current_session or not self.current_session.is_pending:
+            return False
+
+        self.current_session.confirm()
+
+        # Set up auto-rotation timer (only after confirmation)
         if self.auto_rotate:
-            rotate_at = session.remaining_seconds - self.rotate_buffer_seconds
+            rotate_at = self.current_session.remaining_seconds - self.rotate_buffer_seconds
             if rotate_at > 0:
                 self._rotation_timer = threading.Timer(rotate_at, self._auto_rotate)
                 self._rotation_timer.daemon = True
                 self._rotation_timer.start()
 
-        logger.info(
-            f"Session started: {platform.name}/{account.name} "
-            f"(limit: {platform.session_limit_hours}h, "
-            f"GPU: {platform.gpu_type})"
-        )
-        return session
+        return True
 
     def _auto_rotate(self):
         """Called when session is about to expire — rotate to next account."""
@@ -181,6 +283,17 @@ class SessionManager:
 
             new_session = self.start_session(self._on_rotate)
             if new_session:
+                # Auto-confirm the new session for auto-platforms
+                if self.is_auto_platform(new_session.platform.key):
+                    new_session.confirm()
+                    # Set up rotation timer for new session
+                    if self.auto_rotate:
+                        rotate_at = new_session.remaining_seconds - self.rotate_buffer_seconds
+                        if rotate_at > 0:
+                            self._rotation_timer = threading.Timer(rotate_at, self._auto_rotate)
+                            self._rotation_timer.daemon = True
+                            self._rotation_timer.start()
+
                 new_name = f"{new_session.platform.name}/{new_session.account.name}"
                 logger.info(f"Rotated: {old_name} -> {new_name}")
                 if self._on_rotate:
@@ -233,6 +346,32 @@ class SessionManager:
         if self.current_session:
             self.current_session.end()
             self.current_session = None
+
+    def check_current_session_status(self) -> Optional[str]:
+        """Check the real status of the current session from the platform.
+
+        Returns the status string from the handler, or None if no session.
+        Also updates session state if platform reports it stopped.
+        """
+        if not self.current_session or not self.current_session.is_active:
+            return None
+
+        from handlers import get_handler
+        handler = get_handler(self.current_session.platform.key)
+        if not handler:
+            return None
+
+        try:
+            result = handler.check_status(self.current_session.account)
+            if result.get("ok"):
+                status = result.get("status", "unknown")
+                self.current_session.update_platform_status(status)
+                return status
+        except Exception as e:
+            logger.debug(f"Status check failed: {e}")
+            return "error"
+
+        return None
 
     def get_total_available_hours(self) -> float:
         """Calculate total available training hours across all accounts."""

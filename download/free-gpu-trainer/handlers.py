@@ -1,12 +1,12 @@
 """Real platform handlers — actual API integrations for free GPU platforms.
 
 Each handler implements:
-  - push_code(account, script_path)  → push training code to the platform
-  - start_session(account)           → start a notebook/runtime session
-  - check_status(account)            → check if session is still running
-  - stop_session(account)            → stop a running session
-  - get_gpu_info(account)            → get GPU type and availability
-  - is_available(account)            → check if platform is accessible right now
+  - push_code(account, script_path, checkpoint_dir)  → push training code to platform
+  - start_session(account, entry_script)              → start a notebook/runtime session
+  - check_status(account)                             → check if session is still running
+  - stop_session(account)                             → stop a running session
+  - get_gpu_info(account)                             → get GPU type and availability
+  - is_available(account)                             → check if platform is accessible right now
 
 All methods return dicts with 'ok', 'message', and optional data.
 Credentials are read from account.credentials dict (set via /add in TUI).
@@ -148,6 +148,41 @@ def _safe_ssh_args(host: str, user: str, key_file: str) -> Optional[tuple]:
     return (host, user, expanded_key)
 
 
+# ── Platform Type Classification ──────────────────────────────────
+
+# Platforms with real API/SSH push — can auto-confirm sessions
+AUTO_PLATFORMS = {"kaggle", "oracle_cloud", "gcp"}
+
+# Platforms that are notebook-based — always require manual upload + /confirm
+MANUAL_PLATFORMS = {
+    "google_colab", "paperspace", "sagemaker", "lightning_ai",
+    "codesphere", "intel_devcloud", "deepnote", "nvidia_vgpu",
+}
+
+# HuggingFace Spaces — has API push but NOT suitable for long training
+# (ZeroGPU is for inference/demos, not long-running training)
+HF_PLATFORMS = {"huggingface"}
+
+
+def is_auto_platform(platform_key: str) -> bool:
+    """Check if a platform supports fully automated push + start."""
+    return platform_key in AUTO_PLATFORMS
+
+
+def is_manual_platform(platform_key: str) -> bool:
+    """Check if a platform requires manual upload + /confirm."""
+    return platform_key in MANUAL_PLATFORMS or platform_key in HF_PLATFORMS
+
+
+def platform_type_label(platform_key: str) -> str:
+    """Get a human-readable label for the platform automation type."""
+    if platform_key in AUTO_PLATFORMS:
+        return "AUTO"
+    if platform_key in HF_PLATFORMS:
+        return "MANUAL (deployment only)"
+    return "MANUAL"
+
+
 # ── Base Handler ───────────────────────────────────────────────────
 
 class PlatformHandler(ABC):
@@ -161,7 +196,7 @@ class PlatformHandler(ABC):
         pass
 
     @abstractmethod
-    def start_session(self, account) -> dict:
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
         pass
 
     @abstractmethod
@@ -186,6 +221,9 @@ class KaggleHandler(PlatformHandler):
 
     Auth: account.credentials = {"kaggle_username": "...", "kaggle_key": "..."}
     Or set KAGGLE_USERNAME and KAGGLE_KEY env vars.
+
+    This is the most fully-automated handler: push, status check, and
+    checkpoint upload all work via the Kaggle API.
     """
 
     key = "kaggle"
@@ -221,6 +259,57 @@ class KaggleHandler(PlatformHandler):
             logger.debug(f"Kaggle auth failed for {account.name}: {e}")
             return None
 
+    def _upload_checkpoints_as_dataset(self, account, checkpoint_dir: str) -> dict:
+        """Upload checkpoint folder as a Kaggle dataset for resume support.
+
+        This enables cross-session resume: when a new kernel starts,
+        it can pull the dataset to get the latest checkpoints.
+        """
+        ckpt_path = Path(checkpoint_dir)
+        if not ckpt_path.exists() or not any(ckpt_path.iterdir()):
+            return {"ok": True, "message": "No checkpoints to upload"}
+
+        username = os.environ.get("KAGGLE_USERNAME", "")
+        if not username:
+            return {"ok": False, "message": "KAGGLE_USERNAME not set for dataset upload"}
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+        dataset_slug = f"{username}/{safe_name}-checkpoints"
+
+        # Create dataset metadata
+        meta = {
+            "title": f"{safe_name}-checkpoints",
+            "id": dataset_slug,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        meta_path = ckpt_path / "dataset-metadata.json"
+        meta_path.write_text(json.dumps(meta, indent=2))
+
+        try:
+            result = subprocess.run(
+                ["kaggle", "datasets", "create", "-p", str(ckpt_path), "--dir-mode", "zip"],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ, "KAGGLE_USERNAME": os.environ.get("KAGGLE_USERNAME", ""),
+                     "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
+            )
+            if result.returncode == 0:
+                return {"ok": True, "message": f"Checkpoints uploaded as dataset: {dataset_slug}"}
+            # Dataset may already exist — try to update
+            result2 = subprocess.run(
+                ["kaggle", "datasets", "version", "-p", str(ckpt_path), "-m", "Updated checkpoints",
+                 "--dir-mode", "zip"],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ, "KAGGLE_USERNAME": os.environ.get("KAGGLE_USERNAME", ""),
+                     "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
+            )
+            if result2.returncode == 0:
+                return {"ok": True, "message": f"Checkpoints dataset updated: {dataset_slug}"}
+            return {"ok": False, "message": f"Dataset upload failed: {result2.stderr.strip()}"}
+        except FileNotFoundError:
+            return {"ok": False, "message": "kaggle CLI not found for dataset upload"}
+        except Exception as e:
+            return {"ok": False, "message": f"Dataset upload error: {e}"}
+
     @with_retry(max_retries=2, base_delay=2.0)
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
         api = self._get_client(account)
@@ -238,6 +327,12 @@ class KaggleHandler(PlatformHandler):
         # Sanitize account name for kernel slug
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
 
+        # Include checkpoint dataset as a data source if it exists
+        dataset_sources = []
+        ckpt_path = Path(checkpoint_dir)
+        if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+            dataset_sources.append(f"{username}/{safe_name}-checkpoints")
+
         kernel_meta = {
             "id": f"{username}/{safe_name}-training",
             "title": f"{safe_name}-training",
@@ -248,7 +343,7 @@ class KaggleHandler(PlatformHandler):
             "enable_gpu": "true",
             "enable_internet": "true",
             "competition_sources": [],
-            "dataset_sources": [],
+            "dataset_sources": dataset_sources,
             "kernel_sources": [],
         }
 
@@ -264,7 +359,12 @@ class KaggleHandler(PlatformHandler):
                      "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
             )
             if result.returncode == 0:
-                return {"ok": True, "message": f"Kernel pushed: {result.stdout.strip()}"}
+                # Upload checkpoints as dataset for resume support
+                ckpt_result = self._upload_checkpoints_as_dataset(account, checkpoint_dir)
+                ckpt_msg = ""
+                if ckpt_result.get("ok") and "No checkpoints" not in ckpt_result.get("message", ""):
+                    ckpt_msg = f" | Checkpoints: {ckpt_result['message']}"
+                return {"ok": True, "message": f"Kernel pushed: {result.stdout.strip()}{ckpt_msg}"}
             else:
                 return {"ok": False, "message": f"Push failed: {result.stderr.strip()}"}
         except FileNotFoundError:
@@ -272,8 +372,14 @@ class KaggleHandler(PlatformHandler):
         except Exception as e:
             return {"ok": False, "message": f"Push error: {e}"}
 
-    def start_session(self, account) -> dict:
-        return self.push_code(account, "train.py")
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
+        """Start a Kaggle kernel by pushing code.
+
+        Args:
+            account: The Kaggle account to use
+            entry_script: Path to the training script (NOT hardcoded anymore)
+        """
+        return self.push_code(account, entry_script)
 
     @with_retry(max_retries=2, base_delay=2.0)
     def check_status(self, account) -> dict:
@@ -293,7 +399,19 @@ class KaggleHandler(PlatformHandler):
                 capture_output=True, text=True, timeout=30,
             )
             status_text = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
-            return {"ok": True, "status": status_text, "message": status_text}
+            # Map Kaggle status strings to our status vocabulary
+            status_lower = status_text.lower()
+            if "complete" in status_lower:
+                mapped = "complete"
+            elif "running" in status_lower or "executing" in status_lower:
+                mapped = "running"
+            elif "error" in status_lower or "fail" in status_lower:
+                mapped = "error"
+            elif "cancel" in status_lower:
+                mapped = "stopped"
+            else:
+                mapped = status_text
+            return {"ok": True, "status": mapped, "message": status_text}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
 
@@ -310,10 +428,18 @@ class KaggleHandler(PlatformHandler):
 # ── HuggingFace Handler ────────────────────────────────────────────
 
 class HuggingFaceHandler(PlatformHandler):
-    """HuggingFace Spaces/ZeroGPU handler.
+    """HuggingFace Spaces handler.
 
-    Auth: account.credentials = {"hf_token": "..."}
-    Or set HF_TOKEN env var.
+    WARNING: HuggingFace Spaces (ZeroGPU) is designed for hosting ML demos
+    and inference endpoints, NOT for long-running training jobs. The ZeroGPU
+    quota is per-request (typically seconds to minutes), not per-session.
+    The session_limit_hours of 4h in the platform config is misleading.
+
+    Use this handler ONLY for:
+    - Deploying a trained model as a demo
+    - Running quick inference tests
+
+    For actual training, use Kaggle or Oracle Cloud SSH instead.
     """
 
     key = "huggingface"
@@ -371,7 +497,13 @@ class HuggingFaceHandler(PlatformHandler):
 
             os.unlink(app_path)
 
-            return {"ok": True, "message": f"Pushed to Space: {repo_id}", "repo_id": repo_id}
+            return {
+                "ok": True,
+                "message": f"Pushed to Space: {repo_id}",
+                "repo_id": repo_id,
+                "warning": "ZeroGPU Spaces are for inference/demos, not long-running training. "
+                           "Use Kaggle or Oracle SSH for actual training.",
+            }
         except Exception as e:
             return {"ok": False, "message": f"Push error: {e}"}
 
@@ -399,8 +531,8 @@ if __name__ == "__main__":
     demo.launch()
 '''
 
-    def start_session(self, account) -> dict:
-        return self.push_code(account, "train.py")
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
+        return self.push_code(account, entry_script)
 
     @with_retry(max_retries=2, base_delay=2.0)
     def check_status(self, account) -> dict:
@@ -446,6 +578,12 @@ class GoogleColabHandler(PlatformHandler):
 
     Colab has NO public API for creating/managing runtimes.
     Generates .ipynb notebooks for manual upload.
+
+    IMPORTANT: This is a MANUAL platform. After /start, user must:
+    1. Open the generated notebook in Colab
+    2. Enable GPU (Runtime > Change runtime type > T4 GPU)
+    3. Run all cells
+    4. Run /confirm in the TUI to start the countdown timer
 
     Credentials: account.credentials = {"email": "..."}
     (Colab doesn't use API keys — email is for identification/rotation tracking)
@@ -539,8 +677,8 @@ class GoogleColabHandler(PlatformHandler):
             "cells": cells,
         }
 
-    def start_session(self, account) -> dict:
-        return self.push_code(account, "train.py")
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
+        return self.push_code(account, entry_script)
 
     def check_status(self, account) -> dict:
         return {"ok": True, "status": "unknown", "message": "Colab has no status API — check browser"}
@@ -558,6 +696,8 @@ class OracleCloudHandler(PlatformHandler):
     """Oracle Cloud Free Tier handler.
 
     Uses SSH to manage always-free Ampere A1 compute instances.
+    This is a fully automated (AUTO) platform — push, start, status,
+    and stop all work via SSH.
 
     Auth: account.credentials = {"oci_vm_host": "129.x.x.x", "oci_vm_user": "opc", "oci_ssh_key": "~/.ssh/id_rsa"}
     Or set OCI_VM_HOST, OCI_VM_USER, OCI_SSH_KEY env vars.
@@ -598,18 +738,31 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
         try:
+            # Push script
             result = subprocess.run(
                 ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
                 capture_output=True, text=True, timeout=30,
             )
-            if result.returncode == 0:
-                return {"ok": True, "message": f"Pushed to {safe_host}"}
-            return {"ok": False, "message": f"SCP failed: {result.stderr}"}
+            if result.returncode != 0:
+                return {"ok": False, "message": f"SCP failed: {result.stderr}"}
+
+            # Push checkpoints if they exist (for resume support)
+            ckpt_path = Path(checkpoint_dir)
+            if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+                ckpt_result = subprocess.run(
+                    ["scp", "-i", expanded_key, "-r", str(ckpt_path), f"{safe_user}@{safe_host}:~/checkpoints"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                ckpt_msg = " | Checkpoints pushed" if ckpt_result.returncode == 0 else " | Checkpoint push failed"
+            else:
+                ckpt_msg = ""
+
+            return {"ok": True, "message": f"Pushed to {safe_host}{ckpt_msg}"}
         except Exception as e:
             return {"ok": False, "message": f"Push error: {e}"}
 
     @with_retry(max_retries=2, base_delay=2.0)
-    def start_session(self, account) -> dict:
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
             return {"ok": True, "message": "Set OCI VM credentials via /add", "manual": True}
@@ -622,7 +775,7 @@ class OracleCloudHandler(PlatformHandler):
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 "nohup python ~/train.py > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{entry_script} > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -668,6 +821,7 @@ class GCPHandler(PlatformHandler):
     """Google Cloud Platform handler.
 
     Uses SSH to manage GCP VMs with free GPU credits.
+    This is a fully automated (AUTO) platform.
 
     Auth: account.credentials = {"gcp_vm_host": "35.x.x.x", "gcp_vm_user": "ubuntu", "gcp_ssh_key": "~/.ssh/id_rsa"}
     Or set GCP_VM_HOST, GCP_VM_USER, GCP_SSH_KEY env vars.
@@ -706,18 +860,31 @@ class GCPHandler(PlatformHandler):
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
         try:
+            # Push script
             result = subprocess.run(
                 ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
                 capture_output=True, text=True, timeout=30,
             )
-            if result.returncode == 0:
-                return {"ok": True, "message": f"Pushed to {safe_host}"}
-            return {"ok": False, "message": f"SCP failed: {result.stderr}"}
+            if result.returncode != 0:
+                return {"ok": False, "message": f"SCP failed: {result.stderr}"}
+
+            # Push checkpoints for resume support
+            ckpt_path = Path(checkpoint_dir)
+            if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+                ckpt_result = subprocess.run(
+                    ["scp", "-i", expanded_key, "-r", str(ckpt_path), f"{safe_user}@{safe_host}:~/checkpoints"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                ckpt_msg = " | Checkpoints pushed" if ckpt_result.returncode == 0 else " | Checkpoint push failed"
+            else:
+                ckpt_msg = ""
+
+            return {"ok": True, "message": f"Pushed to {safe_host}{ckpt_msg}"}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
     @with_retry(max_retries=2, base_delay=2.0)
-    def start_session(self, account) -> dict:
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
             return {"ok": True, "message": "Set GCP VM credentials via /add", "manual": True}
@@ -730,7 +897,7 @@ class GCPHandler(PlatformHandler):
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 "nohup python ~/train.py > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{entry_script} > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -777,6 +944,11 @@ class NotebookHandler(PlatformHandler):
 
     Generates .ipynb files for manual upload.
     Works for: SageMaker, Paperspace, Deepnote, Lightning AI, Codesphere, Intel DevCloud, NVIDIA vGPU
+
+    IMPORTANT: All these are MANUAL platforms. After /start, user must:
+    1. Upload the generated notebook to the platform
+    2. Run the notebook
+    3. Run /confirm in the TUI to start the countdown timer
     """
 
     def __init__(self, key: str, name: str, url: str):
@@ -847,8 +1019,8 @@ class NotebookHandler(PlatformHandler):
             "cells": cells,
         }
 
-    def start_session(self, account) -> dict:
-        return self.push_code(account, "train.py")
+    def start_session(self, account, entry_script: str = "train.py") -> dict:
+        return self.push_code(account, entry_script)
 
     def check_status(self, account) -> dict:
         return {"ok": True, "status": "unknown", "message": f"{self.name} has no status API — check browser"}
