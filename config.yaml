@@ -1,0 +1,156 @@
+# Free GPU Trainer - Account Configuration
+# Stack multiple accounts per platform for continuous training
+
+platforms:
+  google_colab:
+    enabled: true
+    session_limit_hours: 12
+    cooldown_minutes: 5
+    url: "https://colab.research.google.com/"
+    gpu_type: "T4"
+    accounts:
+      - name: "colab-account-1"
+        # token: "YOUR_COLAB_TOKEN_1"  # Uncomment and fill
+      - name: "colab-account-2"
+        # token: "YOUR_COLAB_TOKEN_2"
+      - name: "colab-account-3"
+        # token: "YOUR_COLAB_TOKEN_3"
+      - name: "colab-account-4"
+        # token: "YOUR_COLAB_TOKEN_4"
+
+  kaggle:
+    enabled: true
+    session_limit_hours: 9  # 30h/week ~ 9h per session
+    weekly_limit_hours: 30
+    cooldown_minutes: 5
+    url: "https://www.kaggle.com/"
+    gpu_type: "Tesla P100"
+    accounts:
+      - name: "kaggle-account-1"
+        # api_key: "YOUR_KAGGLE_API_KEY_1"
+      - name: "kaggle-account-2"
+        # api_key: "YOUR_KAGGLE_API_KEY_2"
+
+  huggingface:
+    enabled: true
+    session_limit_hours: 4
+    cooldown_minutes: 10
+    url: "https://huggingface.co/spaces"
+    gpu_type: "ZeroGPU (dynamic)"
+    accounts:
+      - name: "hf-account-1"
+        # token: "YOUR_HF_TOKEN_1"
+
+  paperspace:
+    enabled: true
+    session_limit_hours: 6
+    cooldown_minutes: 10
+    url: "https://gradient.paperspace.com/"
+    gpu_type: "Quadro M4000"
+    accounts:
+      - name: "paperspace-account-1"
+        # api_key: "YOUR_PAPERSPACE_KEY_1"
+
+  sagemaker:
+    enabled: true
+    session_limit_hours: 4
+    cooldown_minutes: 10
+    url: "https://studiolab.sagemaker.aws/"
+    gpu_type: "T4"
+    accounts:
+      - name: "sagemaker-account-1"
+        # token: "YOUR_SAGEMAKER_TOKEN_1"
+
+  lightning_ai:
+    enabled: true
+    session_limit_hours: 4
+    monthly_limit_hours: 80
+    cooldown_minutes: 10
+    url: "https://lightning.ai/"
+    gpu_type: "GPU (varies)"
+    accounts:
+      - name: "lightning-account-1"
+        # token: "YOUR_LIGHTNING_TOKEN_1"
+
+  codesphere:
+    enabled: true
+    session_limit_hours: 4
+    cooldown_minutes: 15
+    url: "https://codesphere.com/"
+    gpu_type: "Shared GPU"
+    accounts:
+      - name: "codesphere-account-1"
+        # token: "YOUR_CODESPHERE_TOKEN_1"
+
+  oracle_cloud:
+    enabled: true
+    session_limit_hours: 999  # Always-free, effectively unlimited
+    cooldown_minutes: 0
+    url: "https://cloud.oracle.com/free"
+    gpu_type: "Ampere A1"
+    accounts:
+      - name: "oracle-account-1"
+        # token: "YOUR_ORACLE_TOKEN_1"
+
+  gcp:
+    enabled: true
+    session_limit_hours: 8
+    cooldown_minutes: 0
+    url: "https://cloud.google.com/free"
+    gpu_type: "GPU (via credits)"
+    accounts:
+      - name: "gcp-account-1"
+        # token: "YOUR_GCP_TOKEN_1"
+
+  intel_devcloud:
+    enabled: true
+    session_limit_hours: 4
+    cooldown_minutes: 15
+    url: "https://devcloud.intel.com/"
+    gpu_type: "Intel Max/Flex"
+    accounts:
+      - name: "intel-account-1"
+        # token: "YOUR_INTEL_TOKEN_1"
+
+  deepnote:
+    enabled: true
+    session_limit_hours: 4
+    cooldown_minutes: 15
+    url: "https://deepnote.com/"
+    gpu_type: "Limited GPU"
+    accounts:
+      - name: "deepnote-account-1"
+        # token: "YOUR_DEEPNOTE_TOKEN_1"
+
+  nvidia_vgpu:
+    enabled: true
+    session_limit_hours: 8
+    cooldown_minutes: 0
+    trial_days: 90
+    url: "https://www.nvidia.com/en-us/data-center/resources/vgpu-evaluation/"
+    gpu_type: "vGPU (trial)"
+    accounts:
+      - name: "nvidia-account-1"
+        # token: "YOUR_NVIDIA_TOKEN_1"
+
+# Training configuration
+training:
+  # Script to run on each platform session
+  entry_script: "train.py"
+  # How to upload/run your script
+  upload_method: "clipboard"  # clipboard | api | manual
+  # Auto-rotate to next account when session limit approaches
+  auto_rotate: true
+  # Minutes before session end to trigger rotation
+  rotate_buffer_minutes: 10
+  # Save checkpoint before rotation
+  checkpoint_before_rotate: true
+  # Checkpoint directory (relative to training script)
+  checkpoint_dir: "./checkpoints"
+  # Resume from checkpoint on new session
+  resume_from_checkpoint: true
+
+# Logging
+logging:
+  level: "INFO"
+  file: "trainer.log"
