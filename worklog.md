@@ -31,3 +31,67 @@ Stage Summary:
 - Secret redaction and scanning for all notebook/script embeddings
 - README updated with compliance disclaimers
 - Project renamed from "Free GPU Trainer" to "FamilyGPU Orchestrator"
+
+---
+Task ID: 2
+Agent: Main Agent
+Task: Add AutoLoop daemon for continuous GPU scheduling (make it auto)
+
+Work Log:
+- Implemented scheduler/autoloop.py — full AutoLoop daemon class
+  - AutoLoopConfig dataclass with configurable intervals
+  - AutoLoopStats for runtime statistics
+  - Background daemon thread with 5 tasks: lease expiry, preemptive checkpoint, queued jobs, health checks, heartbeat
+  - _check_lease_expiry(): detects expired leases, triggers auto-failover
+  - _check_preemptive_checkpoint(): saves checkpoints before lease expiry (default 10min)
+  - _start_queued_jobs(): auto-starts queued jobs when capacity available
+  - _run_health_checks(): periodic health checks, auto-disable failing accounts
+  - _heartbeat_active_leases(): keeps active leases marked alive
+  - _clear_expired_cooldowns(): makes accounts available after cooldown
+  - submit_job(): queue or immediately start a job via auto loop
+  - force_failover(): manually trigger failover for a stuck job
+  - get_status(): comprehensive status reporting
+- Updated run.py with --auto flag and configurable options
+  - --lease-check-interval, --queue-check-interval, --health-check-interval
+  - --checkpoint-before-expiry (minutes)
+  - --no-failover, --no-auto-start, --no-health-check toggles
+  - Auto loop starts with TUI or API when --auto is passed
+- Updated tui.py with Auto Loop tab
+  - AutoLoopScreen with start/stop/refresh controls
+  - Live stats table (leases checked, failovers triggered, jobs started, etc.)
+  - Configuration display
+  - Activity log showing autoloop-related audit entries
+  - Keyboard shortcut 'A' to toggle auto mode
+  - StatusBar shows AUTO ON/OFF indicator
+  - JobsScreen accepts autoloop for auto-scheduling submit
+  - Clean shutdown on TUI exit
+- Updated api/server.py with auto loop endpoints
+  - GET /autoloop — status
+  - POST /autoloop/start — start daemon with optional config body
+  - POST /autoloop/stop — stop daemon
+  - POST /autoloop/failover — force failover for a specific job_id
+  - POST /jobs uses autoloop.submit_job() when daemon is running
+  - start_api_server() accepts optional autoloop parameter
+- Updated api/__init__.py to include quota_repo and health_repo
+- Updated scheduler/__init__.py to export AutoLoop, AutoLoopConfig, AutoLoopStats
+- Added tests/test_autoloop.py with 17 tests
+  - Config tests (default + custom)
+  - Stats tests (initial + to_dict)
+  - Start/stop lifecycle tests
+  - Lease expiry detection test
+  - Queued job auto-start test
+  - Cooldown clearing test
+  - Status reporting tests
+  - Account error tracking and auto-disable tests
+  - Job submission tests
+- Updated README.md with comprehensive Auto Mode documentation
+- All 117 tests passing (100 original + 17 new)
+- Pushed to GitHub
+
+Stage Summary:
+- AutoLoop daemon implemented and fully tested
+- Continuous scheduling: auto-failover, auto-start, auto-checkpoint, auto-health-check
+- TUI: Auto Loop tab with live monitoring and controls
+- API: /autoloop/* endpoints for daemon management
+- CLI: --auto flag with configurable intervals and feature toggles
+- 117/117 tests passing
