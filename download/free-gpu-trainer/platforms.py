@@ -36,6 +36,7 @@ class AccountConfig:
     name: str
     token: Optional[str] = None
     api_key: Optional[str] = None
+    credentials: dict = field(default_factory=dict)  # Platform-specific creds
     # Runtime state
     status: PlatformStatus = PlatformStatus.AVAILABLE
     sessions_used: int = 0
@@ -94,6 +95,156 @@ class PlatformConfig:
         if all(a.status == PlatformStatus.TRIAL_EXPIRED for a in self.accounts):
             return PlatformStatus.TRIAL_EXPIRED
         return PlatformStatus.EXHAUSTED
+
+
+# ── Credential Schema per Platform ─────────────────────────────────
+# Each entry: key -> { label, hint, secret (mask input), required }
+
+CREDENTIAL_SCHEMAS: dict[str, list[dict]] = {
+    "google_colab": [
+        {
+            "key": "email",
+            "label": "Google Account Email",
+            "hint": "your-email@gmail.com",
+            "secret": False,
+            "required": True,
+        },
+    ],
+    "kaggle": [
+        {
+            "key": "kaggle_username",
+            "label": "Kaggle Username",
+            "hint": "https://www.kaggle.com/settings → API → Create New Token",
+            "secret": False,
+            "required": True,
+        },
+        {
+            "key": "kaggle_key",
+            "label": "Kaggle API Key",
+            "hint": "From kaggle.json → key field",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "huggingface": [
+        {
+            "key": "hf_token",
+            "label": "HuggingFace Token",
+            "hint": "https://huggingface.co/settings/tokens",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "paperspace": [
+        {
+            "key": "paperspace_api_key",
+            "label": "Paperspace API Key",
+            "hint": "https://gradient.paperspace.com/profile/api-keys",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "sagemaker": [
+        {
+            "key": "sagemaker_token",
+            "label": "SageMaker Studio Lab Token",
+            "hint": "Login token from Studio Lab",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "lightning_ai": [
+        {
+            "key": "lightning_token",
+            "label": "Lightning AI API Key",
+            "hint": "https://lightning.ai/settings",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "codesphere": [
+        {
+            "key": "codesphere_token",
+            "label": "Codesphere API Token",
+            "hint": "https://codesphere.com/settings",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "oracle_cloud": [
+        {
+            "key": "oci_vm_host",
+            "label": "VM IP Address",
+            "hint": "e.g. 129.x.x.x",
+            "secret": False,
+            "required": True,
+        },
+        {
+            "key": "oci_vm_user",
+            "label": "SSH Username",
+            "hint": "usually 'opc' for Oracle Linux, 'ubuntu' for Ubuntu",
+            "secret": False,
+            "required": True,
+        },
+        {
+            "key": "oci_ssh_key",
+            "label": "SSH Private Key Path",
+            "hint": "~/.ssh/id_rsa",
+            "secret": False,
+            "required": True,
+        },
+    ],
+    "gcp": [
+        {
+            "key": "gcp_vm_host",
+            "label": "VM External IP",
+            "hint": "e.g. 35.x.x.x",
+            "secret": False,
+            "required": True,
+        },
+        {
+            "key": "gcp_vm_user",
+            "label": "SSH Username",
+            "hint": "usually your GCP username or 'ubuntu'",
+            "secret": False,
+            "required": True,
+        },
+        {
+            "key": "gcp_ssh_key",
+            "label": "SSH Private Key Path",
+            "hint": "~/.ssh/id_rsa or ~/.ssh/google_compute_engine",
+            "secret": False,
+            "required": True,
+        },
+    ],
+    "intel_devcloud": [
+        {
+            "key": "intel_token",
+            "label": "Intel DevCloud Token",
+            "hint": "https://devcloud.intel.com/ — get from profile",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "deepnote": [
+        {
+            "key": "deepnote_token",
+            "label": "Deepnote API Token",
+            "hint": "https://deepnote.com/settings",
+            "secret": True,
+            "required": True,
+        },
+    ],
+    "nvidia_vgpu": [
+        {
+            "key": "nvidia_license_key",
+            "label": "NVIDIA vGPU License Key",
+            "hint": "From evaluation email",
+            "secret": True,
+            "required": True,
+        },
+    ],
+}
 
 
 # ── Platform Registry ──────────────────────────────────────────────
@@ -206,10 +357,18 @@ def build_platform(key: str, cfg: dict) -> PlatformConfig:
     defn = PLATFORM_DEFS[key]
     accounts = []
     for ac in cfg.get("accounts", []):
+        # Extract credentials from account config
+        creds = ac.get("credentials", {})
+        # Also support legacy token/api_key fields
+        if ac.get("token") and "token" not in creds:
+            creds["token"] = ac["token"]
+        if ac.get("api_key") and "api_key" not in creds:
+            creds["api_key"] = ac["api_key"]
         accounts.append(AccountConfig(
             name=ac["name"],
             token=ac.get("token"),
             api_key=ac.get("api_key"),
+            credentials=creds,
         ))
     return PlatformConfig(
         key=key,

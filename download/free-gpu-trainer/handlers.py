@@ -9,6 +9,7 @@ Each handler implements:
   - is_available(account)            → check if platform is accessible right now
 
 All methods return dicts with 'ok', 'message', and optional data.
+Credentials are read from account.credentials dict (set via /add in TUI).
 """
 
 import os
@@ -21,6 +22,20 @@ from typing import Optional
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger("fgt.handler")
+
+
+# ── Credential Helper ─────────────────────────────────────────────
+
+def _cred(account, key: str, env_var: str = "", default: str = "") -> str:
+    """Get a credential value: first from account.credentials, then env var, then default."""
+    val = account.credentials.get(key, "")
+    if val:
+        return val
+    if env_var:
+        val = os.environ.get(env_var, "")
+        if val:
+            return val
+    return default
 
 
 # ── Base Handler ───────────────────────────────────────────────────
@@ -70,7 +85,8 @@ class KaggleHandler(PlatformHandler):
     - Check status via `kaggle kernels status`
     - Pull output via `kaggle kernels output`
 
-    Auth: Set KAGGLE_USERNAME and KAGGLE_KEY env vars, or ~/.kaggle/kaggle.json
+    Auth: account.credentials = {"kaggle_username": "...", "kaggle_key": "..."}
+    Or set KAGGLE_USERNAME and KAGGLE_KEY env vars.
     """
 
     key = "kaggle"
@@ -79,19 +95,16 @@ class KaggleHandler(PlatformHandler):
     def _get_client(self, account):
         """Get authenticated Kaggle API client."""
         try:
-            import os
-            # Set env vars before importing so kaggle doesn't prompt
-            if account.api_key:
-                os.environ["KAGGLE_KEY"] = account.api_key
-            if account.token:
-                try:
-                    creds = json.loads(account.token)
-                    os.environ["KAGGLE_USERNAME"] = creds.get("username", "")
-                    os.environ["KAGGLE_KEY"] = creds.get("key", "")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # Read credentials from account first, then env vars
+            username = _cred(account, "kaggle_username", "KAGGLE_USERNAME")
+            key = _cred(account, "kaggle_key", "KAGGLE_KEY")
 
-            # Check if credentials exist before importing
+            if username:
+                os.environ["KAGGLE_USERNAME"] = username
+            if key:
+                os.environ["KAGGLE_KEY"] = key
+
+            # Check if credentials exist
             has_creds = bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"))
             if not has_creds:
                 # Also check ~/.kaggle/kaggle.json
@@ -113,21 +126,20 @@ class KaggleHandler(PlatformHandler):
             return None
 
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Push a training script as a Kaggle kernel.
-
-        Creates a kernel metadata JSON and pushes it via the API.
-        """
+        """Push a training script as a Kaggle kernel."""
         api = self._get_client(account)
         if not api:
-            return {"ok": False, "message": "Kaggle auth failed. Set KAGGLE_USERNAME + KAGGLE_KEY env vars."}
+            return {"ok": False, "message": "Kaggle auth failed. Set credentials via /add or KAGGLE_USERNAME + KAGGLE_KEY env vars."}
 
         script = Path(script_path)
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
+        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME", "user")
+
         # Create kernel metadata
         kernel_meta = {
-            "id": f"{os.environ.get('KAGGLE_USERNAME', 'user')}/{account.name}-training",
+            "id": f"{username}/{account.name}-training",
             "title": f"{account.name}-training",
             "code_file": str(script),
             "language": "python",
@@ -146,7 +158,6 @@ class KaggleHandler(PlatformHandler):
             json.dump(kernel_meta, f, indent=2)
 
         try:
-            # Push the kernel
             result = subprocess.run(
                 ["kaggle", "kernels", "push", "-p", str(script.parent)],
                 capture_output=True, text=True, timeout=60,
@@ -172,7 +183,7 @@ class KaggleHandler(PlatformHandler):
         if not api:
             return {"ok": False, "message": "Auth failed", "status": "unknown"}
 
-        username = os.environ.get("KAGGLE_USERNAME", "user")
+        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME", "user")
         slug = f"{account.name}-training"
         try:
             result = subprocess.run(
@@ -193,7 +204,7 @@ class KaggleHandler(PlatformHandler):
         api = self._get_client(account)
         if api:
             return {"ok": True, "available": True, "message": "Kaggle API authenticated"}
-        return {"ok": False, "available": False, "message": "Kaggle auth failed"}
+        return {"ok": False, "available": False, "message": "Kaggle auth failed — set credentials via /add"}
 
 
 # ── HuggingFace Handler ────────────────────────────────────────────
@@ -206,7 +217,8 @@ class HuggingFaceHandler(PlatformHandler):
     - Upload training code
     - Start/stop Spaces
 
-    Auth: Set HF_TOKEN env var or pass token in account config
+    Auth: account.credentials = {"hf_token": "..."}
+    Or set HF_TOKEN env var.
     """
 
     key = "huggingface"
@@ -216,7 +228,7 @@ class HuggingFaceHandler(PlatformHandler):
         """Get authenticated HuggingFace API client."""
         try:
             from huggingface_hub import HfApi
-            token = account.token or os.environ.get("HF_TOKEN")
+            token = _cred(account, "hf_token", "HF_TOKEN")
             api = HfApi(token=token)
             return api
         except ImportError:
@@ -229,7 +241,7 @@ class HuggingFaceHandler(PlatformHandler):
         """Push training code to a HuggingFace Space."""
         api = self._get_client(account)
         if not api:
-            return {"ok": False, "message": "HF auth failed. Set HF_TOKEN env var."}
+            return {"ok": False, "message": "HF auth failed. Set HF_TOKEN via /add or env var."}
 
         script = Path(script_path)
         if not script.exists():
@@ -247,12 +259,13 @@ class HuggingFaceHandler(PlatformHandler):
             pass
 
         repo_id = f"{username}/{repo_name}" if username else repo_name
+        token = _cred(account, "hf_token", "HF_TOKEN")
 
         try:
             # Try to create the Space (will fail if exists, that's ok)
             try:
                 from huggingface_hub import create_repo
-                create_repo(repo_id=repo_id, repo_type="space", space_sdk="gradio", token=account.token or os.environ.get("HF_TOKEN"), exist_ok=True)
+                create_repo(repo_id=repo_id, repo_type="space", space_sdk="gradio", token=token, exist_ok=True)
             except Exception:
                 pass
 
@@ -321,10 +334,10 @@ if __name__ == "__main__":
         if not api:
             return {"ok": False, "message": "Auth failed"}
         try:
-            # Pause the space to free GPU
             from huggingface_hub import pause_space
             username = api.whoami().get("name", "user")
-            pause_space(f"{username}/{account.name}-trainer", token=account.token or os.environ.get("HF_TOKEN"))
+            token = _cred(account, "hf_token", "HF_TOKEN")
+            pause_space(f"{username}/{account.name}-trainer", token=token)
             return {"ok": True, "message": "Space paused (GPU freed)"}
         except Exception as e:
             return {"ok": False, "message": f"Stop error: {e}"}
@@ -333,7 +346,7 @@ if __name__ == "__main__":
         api = self._get_client(account)
         if api:
             return {"ok": True, "available": True, "message": "HF API authenticated"}
-        return {"ok": False, "available": False, "message": "HF auth failed"}
+        return {"ok": False, "available": False, "message": "HF auth failed — set credentials via /add"}
 
 
 # ── Google Colab Handler ───────────────────────────────────────────
@@ -345,10 +358,8 @@ class GoogleColabHandler(PlatformHandler):
     Strategy: Generate notebook + use google-colabtools CLI if available,
     otherwise generate a .ipynb file the user manually uploads.
 
-    For automation, we use the approach of:
-    1. Generating a .ipynb notebook file
-    2. Using selenium or colab-cli to push it (if installed)
-    3. Otherwise, telling the user to upload it manually
+    Credentials: account.credentials = {"email": "..."}
+    (Colab doesn't use API keys — the email is for identification/rotation tracking)
     """
 
     key = "google_colab"
@@ -465,35 +476,39 @@ class GoogleColabHandler(PlatformHandler):
 class OracleCloudHandler(PlatformHandler):
     """Oracle Cloud Free Tier handler.
 
-    Uses OCI Python SDK to manage always-free Ampere A1 compute instances.
+    Uses SSH to manage always-free Ampere A1 compute instances.
     Can run Ollama/transformers on the free tier VM.
 
-    Auth: Set OCI config via ~/.oci/config or env vars
+    Auth: account.credentials = {"oci_vm_host": "129.x.x.x", "oci_vm_user": "opc", "oci_ssh_key": "~/.ssh/id_rsa"}
+    Or set OCI_VM_HOST, OCI_VM_USER, OCI_SSH_KEY env vars.
     """
 
     key = "oracle_cloud"
     name = "Oracle Cloud Free Tier"
 
+    def _ssh_config(self, account) -> tuple:
+        """Get SSH config from account credentials or env vars."""
+        host = _cred(account, "oci_vm_host", "OCI_VM_HOST")
+        user = _cred(account, "oci_vm_user", "OCI_VM_USER", "opc")
+        key_file = _cred(account, "oci_ssh_key", "OCI_SSH_KEY", "~/.ssh/id_rsa")
+        return host, user, key_file
+
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
         """Push training code via SSH to Oracle Cloud VM."""
-        script = Path(script_path)
-        if not script.exists():
-            return {"ok": False, "message": f"Script not found: {script_path}"}
-
-        # Try SSH-based push (user must configure SSH key)
-        host = os.environ.get("OCI_VM_HOST", "")
-        user = os.environ.get("OCI_VM_USER", "opc")
-        key_file = os.environ.get("OCI_SSH_KEY", "~/.ssh/id_rsa")
+        host, user, key_file = self._ssh_config(account)
 
         if not host:
             return {
                 "ok": True,
-                "message": "Set OCI_VM_HOST env var to push code. Manual: scp train.py opc@<vm-ip>:~/",
+                "message": "Set OCI VM credentials via /add (host, user, SSH key). Manual: scp train.py opc@<vm-ip>:~/",
                 "manual": True,
             }
 
+        script = Path(script_path)
+        if not script.exists():
+            return {"ok": False, "message": f"Script not found: {script_path}"}
+
         try:
-            # SCP the training script
             result = subprocess.run(
                 ["scp", "-i", os.path.expanduser(key_file), str(script), f"{user}@{host}:~/train.py"],
                 capture_output=True, text=True, timeout=30,
@@ -506,14 +521,12 @@ class OracleCloudHandler(PlatformHandler):
 
     def start_session(self, account) -> dict:
         """Start training via SSH on Oracle Cloud VM."""
-        host = os.environ.get("OCI_VM_HOST", "")
-        user = os.environ.get("OCI_VM_USER", "opc")
-        key_file = os.environ.get("OCI_SSH_KEY", "~/.ssh/id_rsa")
+        host, user, key_file = self._ssh_config(account)
 
         if not host:
             return {
                 "ok": True,
-                "message": "Set OCI_VM_HOST. Manual: ssh opc@<vm-ip> 'python train.py'",
+                "message": "Set OCI VM credentials via /add. Manual: ssh opc@<vm-ip> 'python train.py'",
                 "manual": True,
             }
 
@@ -530,11 +543,9 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": f"Start error: {e}"}
 
     def check_status(self, account) -> dict:
-        host = os.environ.get("OCI_VM_HOST", "")
+        host, user, key_file = self._ssh_config(account)
         if not host:
-            return {"ok": True, "status": "unknown", "message": "No OCI_VM_HOST configured"}
-        user = os.environ.get("OCI_VM_USER", "opc")
-        key_file = os.environ.get("OCI_SSH_KEY", "~/.ssh/id_rsa")
+            return {"ok": True, "status": "unknown", "message": "No OCI VM host configured"}
         try:
             result = subprocess.run(
                 ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
@@ -547,11 +558,9 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": str(e), "status": "error"}
 
     def stop_session(self, account) -> dict:
-        host = os.environ.get("OCI_VM_HOST", "")
+        host, user, key_file = self._ssh_config(account)
         if not host:
-            return {"ok": True, "message": "No OCI_VM_HOST — stop manually"}
-        user = os.environ.get("OCI_VM_USER", "opc")
-        key_file = os.environ.get("OCI_SSH_KEY", "~/.ssh/id_rsa")
+            return {"ok": True, "message": "No OCI VM host — stop manually"}
         try:
             result = subprocess.run(
                 ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}", "pkill -f train.py"],
@@ -562,27 +571,31 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": str(e)}
 
 
-# ── Generic SSH Handler (for GCP, AWS, etc.) ──────────────────────
+# ── GCP Handler ────────────────────────────────────────────────────
 
-class SSHHandler(PlatformHandler):
-    """Generic SSH-based handler for cloud VMs (GCP, Oracle, etc)."""
+class GCPHandler(PlatformHandler):
+    """Google Cloud Platform handler.
 
-    def __init__(self, key: str, name: str):
-        self.key = key
-        self.name = name
+    Uses SSH to manage GCP VMs with free GPU credits.
+
+    Auth: account.credentials = {"gcp_vm_host": "35.x.x.x", "gcp_vm_user": "ubuntu", "gcp_ssh_key": "~/.ssh/id_rsa"}
+    Or set GCP_VM_HOST, GCP_VM_USER, GCP_SSH_KEY env vars.
+    """
+
+    key = "gcp"
+    name = "Google Cloud Platform"
 
     def _ssh_config(self, account) -> tuple:
-        """Get SSH host, user, key from env vars."""
-        prefix = self.key.upper()
-        host = os.environ.get(f"{prefix}_VM_HOST", "")
-        user = os.environ.get(f"{prefix}_VM_USER", "ubuntu")
-        key_file = os.environ.get(f"{prefix}_SSH_KEY", "~/.ssh/id_rsa")
+        """Get SSH config from account credentials or env vars."""
+        host = _cred(account, "gcp_vm_host", "GCP_VM_HOST")
+        user = _cred(account, "gcp_vm_user", "GCP_VM_USER", "ubuntu")
+        key_file = _cred(account, "gcp_ssh_key", "GCP_SSH_KEY", "~/.ssh/id_rsa")
         return host, user, key_file
 
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
-            return {"ok": True, "message": f"Set {self.key.upper()}_VM_HOST env var", "manual": True}
+            return {"ok": True, "message": "Set GCP VM credentials via /add", "manual": True}
         script = Path(script_path)
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
@@ -600,7 +613,7 @@ class SSHHandler(PlatformHandler):
     def start_session(self, account) -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
-            return {"ok": True, "message": f"Set {self.key.upper()}_VM_HOST env var", "manual": True}
+            return {"ok": True, "message": "Set GCP VM credentials via /add", "manual": True}
         try:
             result = subprocess.run(
                 ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
@@ -648,7 +661,7 @@ class NotebookHandler(PlatformHandler):
     """Handler for notebook-based platforms that don't have push APIs.
 
     Generates .ipynb files for manual upload.
-    Works for: SageMaker Studio Lab, Paperspace, Deepnote, Lightning AI, Codesphere
+    Works for: SageMaker Studio Lab, Paperspace, Deepnote, Lightning AI, Codesphere, Intel DevCloud, NVIDIA vGPU
     """
 
     def __init__(self, key: str, name: str, url: str):
@@ -735,7 +748,7 @@ HANDLERS: dict[str, PlatformHandler] = {
     "kaggle": KaggleHandler(),
     "huggingface": HuggingFaceHandler(),
     "oracle_cloud": OracleCloudHandler(),
-    "gcp": SSHHandler("gcp", "Google Cloud Platform"),
+    "gcp": GCPHandler(),
     "paperspace": NotebookHandler("paperspace", "Paperspace Gradient", "https://gradient.paperspace.com/"),
     "sagemaker": NotebookHandler("sagemaker", "Amazon SageMaker Studio Lab", "https://studiolab.sagemaker.aws/"),
     "lightning_ai": NotebookHandler("lightning_ai", "Lightning AI", "https://lightning.ai/"),

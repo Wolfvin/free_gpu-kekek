@@ -8,7 +8,7 @@ Usage:
     python tui.py --status       # Show status and exit
 
 Slash Commands:
-    /add         → Pick platform → See detail + stack accounts
+    /add         → Pick platform → Enter credentials → See detail + stack accounts
     /remove      → Pick platform → Remove it
     /choose      → Pick platform → Force next session there
     /start       Start training
@@ -23,7 +23,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from platforms import (
-    PlatformConfig, AccountConfig, PlatformStatus, build_platform, PLATFORM_DEFS,
+    PlatformConfig, AccountConfig, PlatformStatus, build_platform,
+    PLATFORM_DEFS, CREDENTIAL_SCHEMAS,
 )
 from session import Session, SessionManager
 
@@ -92,6 +93,15 @@ def save_config(config: dict, config_path: str = "config.yaml"):
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
+def mask_credential(val: str) -> str:
+    """Mask a credential value for display: show first 4 + ***."""
+    if not val:
+        return ""
+    if len(val) <= 8:
+        return val[:2] + "***"
+    return val[:4] + "***" + val[-2:]
+
+
 # ── Modal: Platform List Picker ────────────────────────────────────
 
 class PlatformListScreen(ModalScreen[str]):
@@ -119,12 +129,15 @@ class PlatformListScreen(ModalScreen[str]):
                 # Check if already in active platforms
                 already = any(p.key == key for p in self._platforms)
                 tag = " [dim](added)[/dim]" if already else ""
+                cred_count = len(CREDENTIAL_SCHEMAS.get(key, []))
+                cred_info = f"  Creds: [yellow]{cred_count} fields[/yellow]" if cred_count else "  [dim]No API needed[/dim]"
                 ol.add_option(
                     Text.from_markup(
                         f"[bold]{defn['name']}[/bold]{tag}\n"
                         f"  GPU: [cyan]{defn['gpu_type']}[/cyan]  "
                         f"Session: [white]{defn['session_limit_hours']}h[/white]  "
-                        f"URL: [dim]{defn['url']}[/dim]"
+                        f"URL: [dim]{defn['url']}[/dim]\n"
+                        f"{cred_info}"
                     )
                 )
         else:
@@ -159,6 +172,132 @@ class PlatformListScreen(ModalScreen[str]):
         self.dismiss("")
 
 
+# ── Modal: Credential Input ────────────────────────────────────────
+
+class CredentialInputScreen(ModalScreen[dict]):
+    """Multi-field credential input form for a platform.
+
+    Returns dict with:
+      - "name": account name
+      - "credentials": {key: value, ...}
+    Or empty dict if cancelled.
+    """
+
+    def __init__(self, platform_key: str, account_name: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.platform_key = platform_key
+        self.platform_name = PLATFORM_DEFS[platform_key]["name"]
+        self.default_name = account_name
+        self.cred_fields = CREDENTIAL_SCHEMAS.get(platform_key, [])
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="cred-outer"):
+            yield Label(
+                f"[bold]{self.platform_name}[/bold] — Add Account",
+                id="cred-title",
+            )
+            yield Static(
+                f"  GPU: [cyan]{PLATFORM_DEFS[self.platform_key]['gpu_type']}[/cyan]  "
+                f"Session: [white]{PLATFORM_DEFS[self.platform_key]['session_limit_hours']}h[/white]",
+                id="cred-platform-info",
+            )
+
+            yield Label("[bold]Account Name[/bold]", classes="cred-field-label")
+            yield Input(
+                placeholder="e.g. my-colab-1",
+                id="cred-name-input",
+                value=self.default_name,
+            )
+
+            if self.cred_fields:
+                yield Label("[bold]Credentials[/bold]", classes="cred-field-label")
+                yield Static(
+                    "  [dim]These are saved locally in config.yaml and never sent anywhere else.[/dim]",
+                    id="cred-disclaimer",
+                )
+                for cf in self.cred_fields:
+                    yield Label(f"  {cf['label']}", classes="cred-field-label")
+                    if cf.get("hint"):
+                        yield Static(
+                            f"    [dim]{cf['hint']}[/dim]",
+                            classes="cred-hint",
+                        )
+                    yield Input(
+                        placeholder=cf.get("hint", ""),
+                        id=f"cred-field-{cf['key']}",
+                        password=cf.get("secret", False),
+                    )
+
+            yield Horizontal(
+                Button("Add Account", id="cred-submit", variant="success"),
+                Button("Skip Credentials", id="cred-skip", variant="default"),
+                Button("Cancel [dim](Esc)[/dim]", id="cred-cancel", variant="error"),
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cred-submit":
+            self._submit(skip_creds=False)
+        elif event.button.id == "cred-skip":
+            self._submit(skip_creds=True)
+        elif event.button.id == "cred-cancel":
+            self.dismiss({})
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "cred-name-input":
+            # Focus first cred field or submit
+            if self.cred_fields:
+                first_key = self.cred_fields[0]["key"]
+                try:
+                    self.query_one(f"#cred-field-{first_key}", Input).focus()
+                except Exception:
+                    self._submit(skip_creds=False)
+            else:
+                self._submit(skip_creds=False)
+        else:
+            # Advance to next field or submit
+            self._advance_or_submit(event.input.id)
+
+    def _advance_or_submit(self, current_id: str):
+        """After a credential field is submitted, go to next field or submit."""
+        field_keys = [cf["key"] for cf in self.cred_fields]
+        if current_id.startswith("cred-field-"):
+            current_key = current_id[len("cred-field-"):]
+            try:
+                idx = field_keys.index(current_key)
+                if idx + 1 < len(field_keys):
+                    next_key = field_keys[idx + 1]
+                    self.query_one(f"#cred-field-{next_key}", Input).focus()
+                    return
+            except (ValueError, Exception):
+                pass
+        # Last field or unknown — submit
+        self._submit(skip_creds=False)
+
+    def _submit(self, skip_creds: bool = False):
+        name_input = self.query_one("#cred-name-input", Input)
+        name = name_input.value.strip()
+        if not name:
+            # Flash the name input
+            name_input.focus()
+            return
+
+        creds = {}
+        if not skip_creds:
+            for cf in self.cred_fields:
+                try:
+                    inp = self.query_one(f"#cred-field-{cf['key']}", Input)
+                    val = inp.value.strip()
+                    if val:
+                        creds[cf["key"]] = val
+                except Exception:
+                    pass
+
+        self.dismiss({"name": name, "credentials": creds})
+
+    def key_escape(self) -> None:
+        self.dismiss({})
+
+
 # ── Modal: Platform Detail + Account Stack ─────────────────────────
 
 class PlatformDetailScreen(ModalScreen[str]):
@@ -172,7 +311,10 @@ class PlatformDetailScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         p = self.platform
         icon = STATUS_ICONS.get(p.status, "?")
-        with Container(id="pdetail-outer"):
+        cred_schema = CREDENTIAL_SCHEMAS.get(p.key, [])
+        cred_info = f"  Creds needed: [yellow]{len(cred_schema)} fields[/yellow]" if cred_schema else ""
+
+        with VerticalScroll(id="pdetail-outer"):
             yield Label(
                 f"{icon} [bold]{p.name}[/bold]", id="pdetail-title"
             )
@@ -182,7 +324,8 @@ class PlatformDetailScreen(ModalScreen[str]):
                 f"Cooldown: [white]{p.cooldown_minutes}m[/white]\n"
                 f"  Stack: [white]{p.total_accounts}x[/white] accounts = "
                 f"[green]{p.max_continuous_hours:.0f}h[/green] continuous\n"
-                f"  URL: [dim]{p.url}[/dim]",
+                f"  URL: [dim]{p.url}[/dim]\n"
+                f"{cred_info}",
                 id="pdetail-info",
             )
             yield Label("[bold]Stacked Accounts[/bold]", id="pdetail-acct-label")
@@ -190,11 +333,27 @@ class PlatformDetailScreen(ModalScreen[str]):
             if p.accounts:
                 for acc in p.accounts:
                     acc_icon = STATUS_ICONS.get(acc.status, "?")
+                    # Show credential status
+                    cred_status = ""
+                    if cred_schema:
+                        filled = sum(1 for cf in cred_schema if acc.credentials.get(cf["key"]))
+                        total = len(cred_schema)
+                        if filled == total:
+                            cred_status = " [green]creds OK[/green]"
+                        elif filled > 0:
+                            cred_status = f" [yellow]creds {filled}/{total}[/yellow]"
+                        else:
+                            cred_status = " [red]no creds[/red]"
+
                     with Horizontal(classes="acct-row"):
                         yield Static(
                             f"  {acc_icon} {acc.name}   "
-                            f"[dim]{acc.total_hours_used:.1f}h used[/dim]",
+                            f"[dim]{acc.total_hours_used:.1f}h used[/dim]{cred_status}",
                             classes="acct-name",
+                        )
+                        yield Button(
+                            "Edit Creds", id=f"edit-{acc.name}", variant="primary",
+                            classes="acct-edit-btn",
                         )
                         yield Button(
                             "Remove", id=f"rm-{acc.name}", variant="error",
@@ -204,11 +363,7 @@ class PlatformDetailScreen(ModalScreen[str]):
                 yield Static("  [dim]No accounts yet[/dim]", id="pdetail-no-acct")
 
             yield Horizontal(
-                Input(
-                    placeholder="Account name to add...",
-                    id="pdetail-add-input",
-                ),
-                Button("+ Add Account", id="pdetail-add-btn", variant="success"),
+                Button("+ Add Account (with credentials)", id="pdetail-add-btn", variant="success"),
                 Button("Done [dim](Esc)[/dim]", id="pdetail-done", variant="default"),
             )
 
@@ -216,23 +371,91 @@ class PlatformDetailScreen(ModalScreen[str]):
         if event.button.id == "pdetail-done":
             self.dismiss("done")
         elif event.button.id == "pdetail-add-btn":
-            self._do_add()
+            self.dismiss("add_account")
+        elif event.button.id and event.button.id.startswith("edit-"):
+            name = event.button.id[5:]
+            self.dismiss(f"edit_creds:{name}")
         elif event.button.id and event.button.id.startswith("rm-"):
             name = event.button.id[3:]
             self.dismiss(f"remove:{name}")
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "pdetail-add-input":
-            self._do_add()
-
-    def _do_add(self):
-        inp = self.query_one("#pdetail-add-input", Input)
-        name = inp.value.strip()
-        if name:
-            self.dismiss(f"add:{name}")
-
     def key_escape(self) -> None:
         self.dismiss("done")
+
+
+# ── Modal: Edit Credentials ────────────────────────────────────────
+
+class EditCredentialScreen(ModalScreen[dict]):
+    """Edit credentials for an existing account."""
+
+    def __init__(self, platform_key: str, account: AccountConfig, **kwargs):
+        super().__init__(**kwargs)
+        self.platform_key = platform_key
+        self.platform_name = PLATFORM_DEFS[platform_key]["name"]
+        self.account = account
+        self.cred_fields = CREDENTIAL_SCHEMAS.get(platform_key, [])
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="editcred-outer"):
+            yield Label(
+                f"[bold]{self.platform_name}[/bold] — Edit Credentials: {self.account.name}",
+                id="editcred-title",
+            )
+            yield Static(
+                "  [dim]Leave a field blank to keep the existing value.[/dim]\n"
+                "  [dim]Enter 'CLEAR' to remove a credential.[/dim]",
+                id="editcred-hint",
+            )
+
+            if self.cred_fields:
+                for cf in self.cred_fields:
+                    current = self.account.credentials.get(cf["key"], "")
+                    masked = mask_credential(current) if current else "[dim]not set[/dim]"
+                    yield Label(f"  {cf['label']}", classes="cred-field-label")
+                    yield Static(
+                        f"    Current: [yellow]{masked}[/yellow]",
+                        classes="cred-hint",
+                    )
+                    if cf.get("hint"):
+                        yield Static(
+                            f"    [dim]{cf['hint']}[/dim]",
+                            classes="cred-hint",
+                        )
+                    yield Input(
+                        placeholder=f"New value (or leave blank to keep)",
+                        id=f"editcred-field-{cf['key']}",
+                        password=cf.get("secret", False),
+                    )
+            else:
+                yield Static("  [dim]This platform has no credential fields.[/dim]")
+
+            yield Horizontal(
+                Button("Save", id="editcred-save", variant="success"),
+                Button("Cancel [dim](Esc)[/dim]", id="editcred-cancel", variant="default"),
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "editcred-save":
+            self._save()
+        elif event.button.id == "editcred-cancel":
+            self.dismiss({})
+
+    def _save(self):
+        updates = {}
+        for cf in self.cred_fields:
+            try:
+                inp = self.query_one(f"#editcred-field-{cf['key']}", Input)
+                val = inp.value.strip()
+                if val == "CLEAR":
+                    updates[cf["key"]] = None  # Signal to remove
+                elif val:
+                    updates[cf["key"]] = val
+            except Exception:
+                pass
+        self.dismiss({"updates": updates})
+
+    def key_escape(self) -> None:
+        self.dismiss({})
 
 
 # ── Modal: Help ────────────────────────────────────────────────────
@@ -242,7 +465,7 @@ class HelpScreen(ModalScreen):
         with Container(id="help-dialog"):
             yield Label("[bold]Commands[/bold]\n")
             yield Static(
-                "[bold]/add[/bold]      Pick platform → see detail + stack accounts\n"
+                "[bold]/add[/bold]      Pick platform → enter credentials → stack accounts\n"
                 "[bold]/remove[/bold]   Pick platform → remove it\n"
                 "[bold]/choose[/bold]   Pick platform → force next session there\n"
                 "[bold]/start[/bold]    Start training with auto-rotation\n"
@@ -304,7 +527,7 @@ class SessionPanel(Static):
                 f"[bold]⏸ IDLE[/bold]\n\n"
                 f"  Available: [green]{total_h:.1f}h[/green]  "
                 f"Next: [cyan]{next_info}[/cyan]\n\n"
-                f"  [bold]/start[/bold] to train  |  [bold]/add[/bold] to add platform"
+                f"  [bold]/add[/bold] to add platform  |  [bold]/start[/bold] to train"
             )
         self.update(content)
 
@@ -319,10 +542,21 @@ class PlatformCard(Static):
         p = self.platform
         icon = STATUS_ICONS.get(p.status, "?")
         color = STATUS_COLORS.get(p.status, "white")
+        cred_schema = CREDENTIAL_SCHEMAS.get(p.key, [])
         acct_lines = []
         for acc in p.accounts:
             ai = STATUS_ICONS.get(acc.status, "?")
-            acct_lines.append(f"  {ai} {acc.name}  [dim]{acc.total_hours_used:.1f}h[/dim]")
+            cred_status = ""
+            if cred_schema:
+                filled = sum(1 for cf in cred_schema if acc.credentials.get(cf["key"]))
+                total = len(cred_schema)
+                if filled == total:
+                    cred_status = " [green]✓[/green]"
+                elif filled > 0:
+                    cred_status = f" [yellow]{filled}/{total}[/yellow]"
+                else:
+                    cred_status = " [red]✗[/red]"
+            acct_lines.append(f"  {ai} {acc.name}  [dim]{acc.total_hours_used:.1f}h[/dim]{cred_status}")
         accts = "\n".join(acct_lines) if acct_lines else "  [dim]no accounts[/dim]"
         content = (
             f"[bold]{icon} {p.name}[/bold]  "
@@ -431,15 +665,26 @@ class FreeGPUTrainerApp(App):
 
     /* Platform List Modal */
     #plist-outer {
-        padding: 1 2; width: 70; height: 25;
+        padding: 1 2; width: 72; height: 28;
         background: $surface; border: thick $primary;
     }
     #plist-title { padding: 0 0 1 0; }
     #plist-options { height: 1fr; border: solid $primary; }
 
+    /* Credential Input Modal */
+    #cred-outer {
+        padding: 1 2; width: 72; height: 30;
+        background: $surface; border: thick $success;
+    }
+    #cred-title { padding: 0 0 1 0; }
+    #cred-platform-info { padding: 0 0 1 0; }
+    .cred-field-label { padding: 0 0 0 0; margin: 0 0 0 0; }
+    .cred-hint { padding: 0 0 0 0; margin: 0 0 0 0; color: $text-muted; }
+    #cred-disclaimer { padding: 0 0 1 0; }
+
     /* Platform Detail Modal */
     #pdetail-outer {
-        padding: 1 2; width: 70; height: 25;
+        padding: 1 2; width: 72; height: 28;
         background: $surface; border: thick $accent;
     }
     #pdetail-title { padding: 0 0 0 0; }
@@ -447,7 +692,16 @@ class FreeGPUTrainerApp(App):
     #pdetail-acct-label { padding: 1 0 0 0; }
     .acct-row { height: 3; padding: 0 1; }
     .acct-name { width: 1fr; }
+    .acct-edit-btn { width: auto; }
     .acct-rm-btn { width: auto; }
+
+    /* Edit Credential Modal */
+    #editcred-outer {
+        padding: 1 2; width: 72; height: 30;
+        background: $surface; border: thick $warning;
+    }
+    #editcred-title { padding: 0 0 1 0; }
+    #editcred-hint { padding: 0 0 1 0; }
 
     /* Help Modal */
     #help-dialog {
@@ -539,7 +793,7 @@ class FreeGPUTrainerApp(App):
         self._log(f"{len(self.platforms)} platforms, "
                   f"{sum(p.total_accounts for p in self.platforms)} accounts, "
                   f"{self.session_manager.get_total_available_hours():.0f}h total")
-        self._log("[bold]/add[/bold] add platform  [bold]/start[/bold] train  [bold]/help[/bold] commands")
+        self._log("[bold]/add[/bold] add platform + credentials  [bold]/start[/bold] train  [bold]/help[/bold] commands")
 
     def _tick(self):
         try:
@@ -588,7 +842,7 @@ class FreeGPUTrainerApp(App):
     # ── Commands ────────────────────────────────────────────────
 
     def _cmd_add(self):
-        """Show platform list → pick → show detail with account stacking."""
+        """Show platform list → pick → enter credentials → show detail."""
         self.push_screen(
             PlatformListScreen("Pick Platform", self.platforms, show_empty=True),
             self._on_add_pick,
@@ -597,7 +851,8 @@ class FreeGPUTrainerApp(App):
     def _on_add_pick(self, key: str):
         if not key:
             return
-        # If already added, go straight to detail
+
+        # If platform not yet added, add it first
         existing = None
         for p in self.platforms:
             if p.key == key:
@@ -605,9 +860,10 @@ class FreeGPUTrainerApp(App):
                 break
 
         if existing:
+            # Platform already added — go to detail
             self._open_platform_detail(existing)
         else:
-            # Add it first, then open detail
+            # New platform — add it, then go straight to credential input
             defn = PLATFORM_DEFS[key]
             cfg = {"enabled": True, "accounts": []}
             new_p = build_platform(key, cfg)
@@ -617,7 +873,84 @@ class FreeGPUTrainerApp(App):
             self.config["platforms"][key] = cfg
             self._rebuild()
             self._log(f"[green]Added:[/green] {new_p.name}")
-            self._open_platform_detail(new_p)
+            # Now prompt for first account + credentials
+            self._prompt_add_account(new_p)
+
+    def _prompt_add_account(self, platform: PlatformConfig):
+        """Open credential input screen for adding a new account."""
+        self.push_screen(
+            CredentialInputScreen(platform.key),
+            lambda result, p=platform: self._on_credential_input(p, result),
+        )
+
+    def _on_credential_input(self, platform: PlatformConfig, result: dict):
+        """Handle result from CredentialInputScreen."""
+        if not result or not result.get("name"):
+            # Cancelled — open detail if platform has accounts, otherwise just return
+            if platform.accounts:
+                self._open_platform_detail(platform)
+            return
+
+        name = result["name"]
+        creds = result.get("credentials", {})
+
+        # Check duplicate
+        for acc in platform.accounts:
+            if acc.name == name:
+                self._log(f"[yellow]Already exists:[/yellow] {name}")
+                self._prompt_add_account(platform)
+                return
+
+        new_acc = AccountConfig(name=name, credentials=creds)
+        # Also set legacy token/api_key from credentials for handler compatibility
+        self._sync_legacy_fields(new_acc)
+
+        platform.accounts.append(new_acc)
+        # Update config
+        self._save_account_to_config(platform, name, creds)
+        self._rebuild()
+
+        cred_count = len(creds)
+        total_creds = len(CREDENTIAL_SCHEMAS.get(platform.key, []))
+        cred_msg = f" ({cred_count}/{total_creds} creds)" if total_creds > 0 else ""
+        self._log(f"[green]Stacked:[/green] {name} on {platform.name} "
+                  f"(now {platform.total_accounts}x = {platform.max_continuous_hours:.0f}h){cred_msg}")
+
+        # Open detail view to add more or manage
+        self._open_platform_detail(platform)
+
+    def _sync_legacy_fields(self, acc: AccountConfig):
+        """Sync credentials dict to legacy token/api_key fields for handler compatibility."""
+        creds = acc.credentials
+        # Kaggle
+        if "kaggle_username" in creds or "kaggle_key" in creds:
+            import json as _json
+            acc.token = _json.dumps({"username": creds.get("kaggle_username", ""), "key": creds.get("kaggle_key", "")})
+            acc.api_key = creds.get("kaggle_key")
+        # HuggingFace
+        if "hf_token" in creds:
+            acc.token = creds["hf_token"]
+        # Oracle Cloud
+        if "oci_vm_host" in creds:
+            acc.token = creds.get("oci_vm_host")
+        # GCP
+        if "gcp_vm_host" in creds:
+            acc.token = creds.get("gcp_vm_host")
+        # Generic: if there's a token field, set it
+        if "token" in creds:
+            acc.token = creds["token"]
+        if "api_key" in creds:
+            acc.api_key = creds["api_key"]
+
+    def _save_account_to_config(self, platform: PlatformConfig, name: str, creds: dict):
+        """Save account with credentials to config dict."""
+        if platform.key not in self.config.get("platforms", {}):
+            self.config["platforms"][platform.key] = {"enabled": True, "accounts": []}
+
+        acct_cfg = {"name": name}
+        if creds:
+            acct_cfg["credentials"] = creds
+        self.config["platforms"][platform.key].setdefault("accounts", []).append(acct_cfg)
 
     def _open_platform_detail(self, platform: PlatformConfig):
         """Open the detail screen for a platform."""
@@ -631,24 +964,33 @@ class FreeGPUTrainerApp(App):
             self._rebuild()
             return
 
-        if result.startswith("add:"):
+        if result == "add_account":
+            # Open credential input for new account
+            self._prompt_add_account(platform)
+
+        elif result.startswith("edit_creds:"):
+            name = result[11:]
+            # Find account
+            acc = None
+            for a in platform.accounts:
+                if a.name == name:
+                    acc = a
+                    break
+            if acc:
+                self.push_screen(
+                    EditCredentialScreen(platform.key, acc),
+                    lambda r, p=platform, a=acc: self._on_edit_creds(p, a, r),
+                )
+            else:
+                self._open_platform_detail(platform)
+
+        elif result.startswith("add:"):
+            # Legacy add without creds — redirect to credential input
             name = result[4:]
-            # Check duplicate
-            for acc in platform.accounts:
-                if acc.name == name:
-                    self._log(f"[yellow]Already exists:[/yellow] {name}")
-                    self._open_platform_detail(platform)
-                    return
-            new_acc = AccountConfig(name=name)
-            platform.accounts.append(new_acc)
-            # Update config
-            if platform.key in self.config.get("platforms", {}):
-                self.config["platforms"][platform.key].setdefault("accounts", []).append({"name": name})
-            self._log(f"[green]Stacked:[/green] {name} on {platform.name} "
-                      f"(now {platform.total_accounts}x = {platform.max_continuous_hours:.0f}h)")
-            self._rebuild()
-            # Re-open detail
-            self._open_platform_detail(platform)
+            self.push_screen(
+                CredentialInputScreen(platform.key, account_name=name),
+                lambda r, p=platform: self._on_credential_input(p, r),
+            )
 
         elif result.startswith("remove:"):
             name = result[7:]
@@ -670,6 +1012,48 @@ class FreeGPUTrainerApp(App):
                     self._log(f"[yellow]Removed:[/yellow] {name} from {platform.name}")
                     self._rebuild()
             self._open_platform_detail(platform)
+
+    def _on_edit_creds(self, platform: PlatformConfig, account: AccountConfig, result: dict):
+        """Handle credential edit results."""
+        if not result or "updates" not in result:
+            self._open_platform_detail(platform)
+            return
+
+        updates = result["updates"]
+        changed = 0
+        for key, val in updates.items():
+            if val is None:
+                # Remove the credential
+                account.credentials.pop(key, None)
+                changed += 1
+            else:
+                account.credentials[key] = val
+                changed += 1
+
+        if changed > 0:
+            # Sync legacy fields
+            self._sync_legacy_fields(account)
+            # Update config
+            self._update_account_creds_in_config(platform, account)
+            self._rebuild()
+            self._log(f"[green]Updated {changed} credentials[/green] for {account.name}")
+
+        self._open_platform_detail(platform)
+
+    def _update_account_creds_in_config(self, platform: PlatformConfig, account: AccountConfig):
+        """Update credentials in config.yaml for a specific account."""
+        if platform.key not in self.config.get("platforms", {}):
+            return
+        accts = self.config["platforms"][platform.key].get("accounts", [])
+        for a in accts:
+            if a.get("name") == account.name:
+                a["credentials"] = account.credentials
+                # Also update legacy fields
+                if account.token:
+                    a["token"] = account.token
+                if account.api_key:
+                    a["api_key"] = account.api_key
+                break
 
     def _cmd_remove(self):
         self.push_screen(
@@ -732,7 +1116,7 @@ class FreeGPUTrainerApp(App):
             self._gen_script(session)
             self.training_active = True
         else:
-            self._log("[red]No accounts![/red] Use /add then stack accounts")
+            self._log("[red]No accounts![/red] Use /add then stack accounts with credentials")
 
     def _cmd_stop(self):
         if self.session_manager and self.session_manager.current_session:
