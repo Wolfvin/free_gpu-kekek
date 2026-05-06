@@ -6,6 +6,7 @@ A quota-aware multi-account GPU scheduler with screens for:
   - Leases view
   - Usage/ledger view
   - Audit logs view
+  - Auto Loop monitor and controls
   - System settings
 """
 
@@ -30,6 +31,7 @@ from db.repositories import (
     AuditLogRepository, HealthRepository,
 )
 from scheduler.request import JobRequest, GPU_PROFILES
+from scheduler.autoloop import AutoLoop, AutoLoopConfig
 from api import GPUSchedulerAPI
 from vault import get_storage_mode, encrypt_credentials, get_credential_status
 
@@ -39,11 +41,12 @@ logger = logging.getLogger("fgt.tui")
 # ── Reactive Status Bar ─────────────────────────────────────────
 
 class StatusBar(Static):
-    """Bottom status bar showing vault mode and account count."""
+    """Bottom status bar showing vault mode, account count, and auto loop status."""
 
     vault_mode: reactive[str] = reactive("")
     account_count: reactive[int] = reactive(0)
     active_leases: reactive[int] = reactive(0)
+    auto_loop_running: reactive[bool] = reactive(False)
 
     def watch_vault_mode(self, mode: str):
         self._update()
@@ -54,11 +57,16 @@ class StatusBar(Static):
     def watch_active_leases(self, count: int):
         self._update()
 
+    def watch_auto_loop_running(self, running: bool):
+        self._update()
+
     def _update(self):
+        auto_status = "AUTO ON" if self.auto_loop_running else "AUTO OFF"
         self.update(
             f"  Vault: {self.vault_mode}  |  "
             f"Accounts: {self.account_count}  |  "
-            f"Active Leases: {self.active_leases}"
+            f"Active Leases: {self.active_leases}  |  "
+            f"{auto_status}"
         )
 
 
@@ -155,7 +163,7 @@ class AddAccountModal(Container):
         owner_options = [(o["name"], o["id"]) for o in owner_list]
 
         if not owner_list:
-            yield Label("⚠ No owners configured. Add an owner first (System > Owners).")
+            yield Label("No owners configured. Add an owner first (System > Owners).")
 
         yield Label("Owner:")
         yield Select(owner_options, id="add-owner", prompt="Select owner...")
@@ -241,9 +249,10 @@ class AddAccountModal(Container):
 class JobsScreen(VerticalScroll):
     """Screen for managing jobs."""
 
-    def __init__(self, api: GPUSchedulerAPI, **kwargs):
+    def __init__(self, api: GPUSchedulerAPI, autoloop: Optional[AutoLoop] = None, **kwargs):
         super().__init__(**kwargs)
         self.api = api
+        self.autoloop = autoloop
 
     def compose(self) -> ComposeResult:
         yield Label("## Job Management", classes="title")
@@ -270,13 +279,13 @@ class JobsScreen(VerticalScroll):
         if event.button.id == "refresh-jobs-btn":
             self._refresh()
         elif event.button.id == "submit-job-btn":
-            self.app.push_screen(SubmitJobModal(self.api))
+            self.app.push_screen(SubmitJobModal(self.api, self.autoloop))
 
     def _refresh(self):
         # Active jobs
         active_table = self.query_one("#active-jobs-table", DataTable)
         active_table.clear()
-        for status in ("queued", "starting", "running"):
+        for status in ("queued", "starting", "running", "checkpointing"):
             for j in self.api.job_repo.list_all(status=status):
                 lease = self.api.lease_repo.get_active_for_job(j["id"])
                 provider = lease["provider_key"] if lease else "-"
@@ -290,7 +299,7 @@ class JobsScreen(VerticalScroll):
         # History
         history_table = self.query_one("#history-jobs-table", DataTable)
         history_table.clear()
-        for status in ("completed", "failed", "cancelled"):
+        for status in ("completed", "failed", "cancelled", "expired"):
             for j in self.api.job_repo.list_all(status=status):
                 completed = j.get("completed_at", "-") or "-"
                 reason = j.get("failure_reason", "-") or "-"
@@ -307,12 +316,17 @@ class JobsScreen(VerticalScroll):
 class SubmitJobModal(Container):
     """Modal for submitting a new training job."""
 
-    def __init__(self, api: GPUSchedulerAPI, **kwargs):
+    def __init__(self, api: GPUSchedulerAPI, autoloop: Optional[AutoLoop] = None, **kwargs):
         super().__init__(**kwargs)
         self.api = api
+        self.autoloop = autoloop
 
     def compose(self) -> ComposeResult:
         yield Label("## Submit Training Job", classes="title")
+
+        auto_note = ""
+        if self.autoloop and self.autoloop.is_running:
+            auto_note = "\nAuto mode is ON — job will auto-start when capacity is available"
 
         yield Label("Job Name:")
         yield Input(id="job-name", placeholder="e.g. train-lora-001")
@@ -333,6 +347,9 @@ class SubmitJobModal(Container):
 
         yield Label("Entrypoint Script:")
         yield Input(id="job-entrypoint", value="train.py")
+
+        if auto_note:
+            yield Label(auto_note, classes="title")
 
         yield Horizontal(
             Button("Submit", id="submit-btn", variant="success"),
@@ -370,12 +387,22 @@ class SubmitJobModal(Container):
                 checkpoint_required=True,
             )
 
-            result = self.api.request_gpu(request)
+            # Use autoloop if available, otherwise direct API
+            if self.autoloop and self.autoloop.is_running:
+                result = self.autoloop.submit_job(request)
+            else:
+                result = self.api.request_gpu(request)
 
             if result.status == "accepted":
                 self.app.notify(
                     f"Job submitted! Provider: {result.provider}, "
                     f"Owner: {result.account_owner}",
+                    severity="information",
+                )
+            elif result.status == "queued":
+                self.app.notify(
+                    f"Job queued — auto-start when capacity available. "
+                    f"Reason: {result.message}",
                     severity="information",
                 )
             else:
@@ -528,6 +555,164 @@ class AuditScreen(VerticalScroll):
             )
 
 
+# ── Auto Loop Screen ───────────────────────────────────────────
+
+class AutoLoopScreen(VerticalScroll):
+    """Screen for monitoring and controlling the auto loop daemon."""
+
+    def __init__(self, api: GPUSchedulerAPI, autoloop: Optional[AutoLoop] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.api = api
+        self.autoloop = autoloop
+
+    def compose(self) -> ComposeResult:
+        yield Label("## Auto Loop Orchestrator", classes="title")
+
+        yield Horizontal(
+            Button("Start Auto", id="autoloop-start-btn", variant="success"),
+            Button("Stop Auto", id="autoloop-stop-btn", variant="error"),
+            Button("Refresh", id="autoloop-refresh-btn", variant="primary"),
+        )
+
+        yield Label("### Status")
+        yield DataTable(id="autoloop-status-table")
+
+        yield Label("### Configuration")
+        yield DataTable(id="autoloop-config-table")
+
+        yield Label("### Activity Log (auto loop events)")
+        yield DataTable(id="autoloop-activity-table")
+
+    def on_mount(self):
+        # Status table
+        status_table = self.query_one("#autoloop-status-table", DataTable)
+        status_table.add_columns("Metric", "Value")
+
+        # Config table
+        config_table = self.query_one("#autoloop-config-table", DataTable)
+        config_table.add_columns("Setting", "Value")
+
+        # Activity table
+        activity_table = self.query_one("#autoloop-activity-table", DataTable)
+        activity_table.add_columns("Time", "Action", "Entity", "Message")
+
+        self._refresh()
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "autoloop-start-btn":
+            self._start_autoloop()
+        elif event.button.id == "autoloop-stop-btn":
+            self._stop_autoloop()
+        elif event.button.id == "autoloop-refresh-btn":
+            self._refresh()
+
+    def _start_autoloop(self):
+        if self.autoloop and not self.autoloop.is_running:
+            self.autoloop.start()
+            self.app.notify("Auto loop started!", severity="information")
+            # Update status bar
+            try:
+                bar = self.app.query_one("#status-bar", StatusBar)
+                bar.auto_loop_running = True
+            except Exception:
+                pass
+        elif self.autoloop and self.autoloop.is_running:
+            self.app.notify("Auto loop is already running", severity="warning")
+        else:
+            self.app.notify("Auto loop not available", severity="error")
+        self._refresh()
+
+    def _stop_autoloop(self):
+        if self.autoloop and self.autoloop.is_running:
+            self.autoloop.stop()
+            self.app.notify("Auto loop stopped", severity="information")
+            # Update status bar
+            try:
+                bar = self.app.query_one("#status-bar", StatusBar)
+                bar.auto_loop_running = False
+            except Exception:
+                pass
+        else:
+            self.app.notify("Auto loop is not running", severity="warning")
+        self._refresh()
+
+    def _refresh(self):
+        # Get auto loop status
+        if self.autoloop:
+            status_data = self.autoloop.get_status()
+        else:
+            status_data = {
+                "auto_loop": {"is_running": False, "started_at": None},
+                "config": {},
+                "active_leases": 0,
+                "queued_jobs": 0,
+                "available_accounts": 0,
+            }
+
+        # Status table
+        status_table = self.query_one("#autoloop-status-table", DataTable)
+        status_table.clear()
+        loop_stats = status_data.get("auto_loop", {})
+
+        status_rows = [
+            ("Running", "YES" if loop_stats.get("is_running") else "NO"),
+            ("Started At", loop_stats.get("started_at", "-") or "-"),
+            ("Active Leases", str(status_data.get("active_leases", 0))),
+            ("Queued Jobs", str(status_data.get("queued_jobs", 0))),
+            ("Available Accounts", str(status_data.get("available_accounts", 0))),
+            ("Leases Checked", str(loop_stats.get("total_leases_checked", 0))),
+            ("Expiries Handled", str(loop_stats.get("total_expiries_handled", 0))),
+            ("Failovers Triggered", str(loop_stats.get("total_failovers_triggered", 0))),
+            ("Jobs Auto-Started", str(loop_stats.get("total_jobs_started", 0))),
+            ("Health Checks", str(loop_stats.get("total_health_checks", 0))),
+            ("Checkpoints Saved", str(loop_stats.get("total_checkpoints", 0))),
+            ("Errors", str(loop_stats.get("total_errors", 0))),
+            ("Last Lease Check", loop_stats.get("last_lease_check", "-") or "-"),
+            ("Last Queue Check", loop_stats.get("last_queue_check", "-") or "-"),
+            ("Last Health Check", loop_stats.get("last_health_check", "-") or "-"),
+        ]
+        for metric, value in status_rows:
+            status_table.add_row(metric, value)
+
+        # Config table
+        config_table = self.query_one("#autoloop-config-table", DataTable)
+        config_table.clear()
+        config_data = status_data.get("config", {})
+        if config_data:
+            config_rows = [
+                ("Lease Check Interval", f"{config_data.get('lease_check_interval', 30)}s"),
+                ("Queue Check Interval", f"{config_data.get('queue_check_interval', 15)}s"),
+                ("Health Check Interval", f"{config_data.get('health_check_interval', 300)}s"),
+                ("Auto Failover", "YES" if config_data.get("auto_failover", True) else "NO"),
+                ("Auto Start Queued", "YES" if config_data.get("auto_start_queued", True) else "NO"),
+                ("Auto Health Check", "YES" if config_data.get("auto_health_check", True) else "NO"),
+                ("Auto Checkpoint", "YES" if config_data.get("auto_checkpoint", True) else "NO"),
+                ("Checkpoint Before Expiry", f"{config_data.get('checkpoint_before_expiry_minutes', 10)}min"),
+            ]
+            for setting, value in config_rows:
+                config_table.add_row(setting, value)
+        else:
+            config_table.add_row("Config", "Default (use --auto flag to customize)")
+
+        # Activity table — show recent audit logs for autoloop actions
+        activity_table = self.query_one("#autoloop-activity-table", DataTable)
+        activity_table.clear()
+        autoloop_actions = [
+            "autoloop_start", "autoloop_stop", "autoloop_start_job",
+            "autoloop_disable_account", "failover", "lease_expired",
+            "create_lease", "start_job",
+        ]
+        all_logs = self.api.audit_repo.list_recent(limit=100)
+        autoloop_logs = [l for l in all_logs if l.get("action") in autoloop_actions][:20]
+        for log in autoloop_logs:
+            activity_table.add_row(
+                log["created_at"][:19],
+                log["action"],
+                f"{log.get('entity_type', '')}:{log.get('entity_id', '')[:8]}",
+                (log.get("message") or "")[:50],
+            )
+
+
 # ── Settings Screen ─────────────────────────────────────────────
 
 class SettingsScreen(VerticalScroll):
@@ -628,6 +813,10 @@ class FamilyGPUTUI(App):
 
     A TUI application for managing family GPU accounts, submitting
     training jobs, and monitoring usage across 12 providers.
+
+    With auto mode enabled, the AutoLoop daemon runs in the background
+    continuously monitoring leases, auto-failing over, and starting
+    queued jobs when capacity is available.
     """
 
     TITLE = "FamilyGPU Orchestrator"
@@ -665,11 +854,14 @@ class FamilyGPUTUI(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("a", "toggle_auto", "Toggle Auto"),
     ]
 
-    def __init__(self, db_path: Optional[str] = None, **kwargs):
+    def __init__(self, db_path: Optional[str] = None,
+                 autoloop: Optional[AutoLoop] = None, **kwargs):
         super().__init__(**kwargs)
         self.db_path = db_path
+        self.autoloop = autoloop
         self.api: Optional[GPUSchedulerAPI] = None
 
     def on_mount(self):
@@ -680,10 +872,12 @@ class FamilyGPUTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with TabbedContent():
+            with TabPane("Auto Loop", id="tab-auto"):
+                yield AutoLoopScreen(self.api, self.autoloop) if self.api else Static("Loading...")
             with TabPane("Accounts", id="tab-accounts"):
                 yield AccountsScreen(self.api) if self.api else Static("Loading...")
             with TabPane("Jobs", id="tab-jobs"):
-                yield JobsScreen(self.api) if self.api else Static("Loading...")
+                yield JobsScreen(self.api, self.autoloop) if self.api else Static("Loading...")
             with TabPane("Leases", id="tab-leases"):
                 yield LeasesScreen(self.api) if self.api else Static("Loading...")
             with TabPane("Usage", id="tab-usage"):
@@ -703,6 +897,8 @@ class FamilyGPUTUI(App):
             bar.vault_mode = get_storage_mode()
             bar.account_count = len(self.api.account_repo.list_all())
             bar.active_leases = len(self.api.lease_repo.list_active())
+            if self.autoloop:
+                bar.auto_loop_running = self.autoloop.is_running
         except Exception:
             pass
 
@@ -710,6 +906,26 @@ class FamilyGPUTUI(App):
         """Refresh the current tab."""
         self._update_status_bar()
         self.notify("Refreshed", severity="information")
+
+    def action_toggle_auto(self):
+        """Toggle auto loop on/off (keyboard shortcut: A)."""
+        if not self.autoloop:
+            self.notify("Auto loop not available (launch with --auto flag)", severity="warning")
+            return
+
+        if self.autoloop.is_running:
+            self.autoloop.stop()
+            self.notify("Auto loop STOPPED", severity="warning")
+        else:
+            self.autoloop.start()
+            self.notify("Auto loop STARTED — continuous scheduling active", severity="information")
+
+        self._update_status_bar()
+
+    def on_unmount(self):
+        """Clean up when the TUI exits."""
+        if self.autoloop and self.autoloop.is_running:
+            self.autoloop.stop()
 
 
 def run_app():

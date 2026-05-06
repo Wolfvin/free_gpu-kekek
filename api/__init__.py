@@ -10,7 +10,7 @@ import logging
 from typing import Optional
 
 from db.connection import init_db
-from db.repositories import JobRepository, LeaseRepository, AccountRepository, AuditLogRepository
+from db.repositories import JobRepository, LeaseRepository, AccountRepository, AuditLogRepository, QuotaLedgerRepository, HealthRepository
 from scheduler.request import JobRequest, JobRequestResult, FailureReason
 from scheduler.selector import AccountSelector
 from scheduler.leases import LeaseManager
@@ -41,6 +41,8 @@ class GPUSchedulerAPI:
         self.lease_repo = LeaseRepository()
         self.account_repo = AccountRepository()
         self.audit_repo = AuditLogRepository()
+        self.quota_repo = QuotaLedgerRepository()
+        self.health_repo = HealthRepository()
         self.selector = AccountSelector()
         self.lease_manager = LeaseManager()
         self.failover = FailoverManager()
