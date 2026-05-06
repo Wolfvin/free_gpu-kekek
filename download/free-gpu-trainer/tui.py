@@ -27,6 +27,8 @@ from platforms import (
     PLATFORM_DEFS, CREDENTIAL_SCHEMAS,
 )
 from session import Session, SessionManager
+from vault import encrypt_credentials, decrypt_credentials, delete_credentials, get_storage_mode
+from handlers import validate_account_name
 
 import time
 import yaml
@@ -277,7 +279,15 @@ class CredentialInputScreen(ModalScreen[dict]):
         name_input = self.query_one("#cred-name-input", Input)
         name = name_input.value.strip()
         if not name:
-            # Flash the name input
+            name_input.focus()
+            return
+
+        # Validate account name
+        is_valid, err_msg = validate_account_name(name)
+        if not is_valid:
+            # Show error in the input placeholder and refocus
+            name_input.value = ""
+            name_input.placeholder = f"✗ {err_msg}"
             name_input.focus()
             return
 
@@ -740,9 +750,10 @@ class FreeGPUTrainerApp(App):
 
     def _build_platforms(self):
         self.platforms = []
+        config_dir = os.path.dirname(os.path.abspath(self.config_path))
         for key, cfg in self.config.get("platforms", {}).items():
             if key in PLATFORM_DEFS:
-                self.platforms.append(build_platform(key, cfg))
+                self.platforms.append(build_platform(key, cfg, config_dir))
         tc = self.config.get("training", {})
         self.session_manager = SessionManager(
             platforms=self.platforms,
@@ -793,6 +804,7 @@ class FreeGPUTrainerApp(App):
         self._log(f"{len(self.platforms)} platforms, "
                   f"{sum(p.total_accounts for p in self.platforms)} accounts, "
                   f"{self.session_manager.get_total_available_hours():.0f}h total")
+        self._log(f"[dim]Credential storage: {get_storage_mode()}[/dim]")
         self._log("[bold]/add[/bold] add platform + credentials  [bold]/start[/bold] train  [bold]/help[/bold] commands")
 
     def _tick(self):
@@ -886,7 +898,6 @@ class FreeGPUTrainerApp(App):
     def _on_credential_input(self, platform: PlatformConfig, result: dict):
         """Handle result from CredentialInputScreen."""
         if not result or not result.get("name"):
-            # Cancelled — open detail if platform has accounts, otherwise just return
             if platform.accounts:
                 self._open_platform_detail(platform)
             return
@@ -901,22 +912,27 @@ class FreeGPUTrainerApp(App):
                 self._prompt_add_account(platform)
                 return
 
+        # Encrypt credentials for storage
+        config_dir = os.path.dirname(os.path.abspath(self.config_path))
+        encrypted_creds = encrypt_credentials(platform.key, name, creds, config_dir)
+
+        # Store decrypted creds in memory for runtime use
         new_acc = AccountConfig(name=name, credentials=creds)
-        # Also set legacy token/api_key from credentials for handler compatibility
         self._sync_legacy_fields(new_acc)
 
         platform.accounts.append(new_acc)
-        # Update config
-        self._save_account_to_config(platform, name, creds)
+        # Save encrypted creds to config dict
+        self._save_account_to_config(platform, name, encrypted_creds)
         self._rebuild()
 
         cred_count = len(creds)
         total_creds = len(CREDENTIAL_SCHEMAS.get(platform.key, []))
         cred_msg = f" ({cred_count}/{total_creds} creds)" if total_creds > 0 else ""
+        storage_mode = get_storage_mode()
         self._log(f"[green]Stacked:[/green] {name} on {platform.name} "
                   f"(now {platform.total_accounts}x = {platform.max_continuous_hours:.0f}h){cred_msg}")
+        self._log(f"[dim]Storage: {storage_mode}[/dim]")
 
-        # Open detail view to add more or manage
         self._open_platform_detail(platform)
 
     def _sync_legacy_fields(self, acc: AccountConfig):
@@ -1010,6 +1026,8 @@ class FreeGPUTrainerApp(App):
                             a for a in accts if a.get("name") != name
                         ]
                     self._log(f"[yellow]Removed:[/yellow] {name} from {platform.name}")
+                    # Delete from keyring too
+                    delete_credentials(platform.key, name)
                     self._rebuild()
             self._open_platform_detail(platform)
 
@@ -1023,7 +1041,6 @@ class FreeGPUTrainerApp(App):
         changed = 0
         for key, val in updates.items():
             if val is None:
-                # Remove the credential
                 account.credentials.pop(key, None)
                 changed += 1
             else:
@@ -1031,28 +1048,26 @@ class FreeGPUTrainerApp(App):
                 changed += 1
 
         if changed > 0:
-            # Sync legacy fields
             self._sync_legacy_fields(account)
-            # Update config
-            self._update_account_creds_in_config(platform, account)
+            # Re-encrypt and update config
+            config_dir = os.path.dirname(os.path.abspath(self.config_path))
+            encrypted = encrypt_credentials(platform.key, account.name, account.credentials, config_dir)
+            self._update_account_creds_in_config(platform, account, encrypted)
             self._rebuild()
             self._log(f"[green]Updated {changed} credentials[/green] for {account.name}")
+            self._log(f"[dim]Storage: {get_storage_mode()}[/dim]")
 
         self._open_platform_detail(platform)
 
-    def _update_account_creds_in_config(self, platform: PlatformConfig, account: AccountConfig):
+    def _update_account_creds_in_config(self, platform: PlatformConfig, account: AccountConfig,
+                                         encrypted_creds: dict = None):
         """Update credentials in config.yaml for a specific account."""
         if platform.key not in self.config.get("platforms", {}):
             return
         accts = self.config["platforms"][platform.key].get("accounts", [])
         for a in accts:
             if a.get("name") == account.name:
-                a["credentials"] = account.credentials
-                # Also update legacy fields
-                if account.token:
-                    a["token"] = account.token
-                if account.api_key:
-                    a["api_key"] = account.api_key
+                a["credentials"] = encrypted_creds if encrypted_creds else account.credentials
                 break
 
     def _cmd_remove(self):

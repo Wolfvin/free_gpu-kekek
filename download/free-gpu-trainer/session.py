@@ -61,7 +61,9 @@ class Session:
         if cooldown_s > 0:
             self.account.status = PlatformStatus.COOLDOWN
             self.account.cooldown_until = time.time() + cooldown_s
-            threading.Timer(cooldown_s, self._end_cooldown, args=[self.account]).start()
+            cooldown_timer = threading.Timer(cooldown_s, self._end_cooldown, args=[self.account])
+            cooldown_timer.daemon = True
+            cooldown_timer.start()
         else:
             self.account.status = PlatformStatus.AVAILABLE
         logger.info(

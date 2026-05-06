@@ -1,10 +1,14 @@
 __pycache__/
 *.pyc
 *.pyo
-.checkpoints/
+checkpoints/
 *.egg-info/
 dist/
 build/
-.run_session.sh
-.run_session_notebook.py
+run_session.sh
+*.ipynb
 trainer.log
+config.yaml
+config.yaml.bak
+*.key
+.env
