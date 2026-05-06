@@ -735,7 +735,19 @@ class FreeGPUTrainerApp(App):
             self._log("[red]No accounts![/red] Use /add then stack accounts")
 
     def _cmd_stop(self):
-        if self.session_manager:
+        if self.session_manager and self.session_manager.current_session:
+            # Use real handler to stop session
+            from handlers import get_handler
+            s = self.session_manager.current_session
+            handler = get_handler(s.platform.key)
+            if handler:
+                result = handler.stop_session(s.account)
+                if not result.get("ok"):
+                    self._log(f"[dim]Handler stop: {result.get('message', '')}[/dim]")
+            self.session_manager.stop()
+            self._log("[yellow]Stopped.[/yellow]")
+            self.training_active = False
+        elif self.session_manager:
             self.session_manager.stop()
             self._log("[yellow]Stopped.[/yellow]")
             self.training_active = False
@@ -793,19 +805,39 @@ class FreeGPUTrainerApp(App):
             pass
 
     def _gen_script(self, session):
+        """Generate scripts AND push code via real platform handlers."""
         from trainer import TrainingJob
+        from handlers import get_handler
         tc = self.config.get("training", {})
-        job = TrainingJob(
-            script_path=tc.get("entry_script", "train.py"),
-            checkpoint_dir=tc.get("checkpoint_dir", "./checkpoints"),
-            resume=tc.get("resume_from_checkpoint", True),
-        )
+        script_path = tc.get("entry_script", "train.py")
+        checkpoint_dir = tc.get("checkpoint_dir", "./checkpoints")
+        resume = tc.get("resume_from_checkpoint", True)
+
+        # Generate local scripts
+        job = TrainingJob(script_path=script_path, checkpoint_dir=checkpoint_dir, resume=resume)
         Path("./run_session.sh").write_text(job.generate_run_command(session.platform))
-        if session.platform.key in ("google_colab", "kaggle", "paperspace", "sagemaker", "deepnote"):
-            Path("./run_session_notebook.py").write_text(job.generate_notebook_code(session.platform))
-            self._log(f"[cyan]Notebook code →[/cyan] run_session_notebook.py")
+        self._log(f"[cyan]Script →[/cyan] run_session.sh")
+
+        # Use real handler to push code to platform
+        handler = get_handler(session.platform.key)
+        if handler:
+            self._log(f"[dim]Pushing code via {handler.name} handler...[/dim]")
+            result = handler.push_code(session.account, script_path, checkpoint_dir)
+            if result.get("ok"):
+                msg = result.get("message", "OK")
+                self._log(f"[green]Handler:[/green] {msg}")
+                if result.get("manual"):
+                    self._log(f"[yellow]Manual step:[/yellow] upload notebook to {session.platform.name}")
+                    if result.get("notebook_path"):
+                        self._log(f"  Notebook: {result['notebook_path']}")
+                    if result.get("url"):
+                        self._log(f"  URL: {result['url']}")
+                if result.get("notebook_path"):
+                    self._log(f"[cyan]Notebook →[/cyan] {result['notebook_path']}")
+            else:
+                self._log(f"[red]Handler failed:[/red] {result.get('message', 'unknown error')}")
         else:
-            self._log(f"[cyan]Script →[/cyan] run_session.sh")
+            self._log(f"[dim]No handler for {session.platform.key} — using local scripts only[/dim]")
 
 
 def run_app():
