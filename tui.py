@@ -11,8 +11,15 @@ Session lifecycle:
   Timer expires → Auto-rotate to next account (or end if none)
 
 Usage:
-    python tui.py                # Launch TUI
-    python tui.py --status       # Show status and exit
+    python tui.py                       # Launch TUI
+    python tui.py --status              # Show human-readable status
+    python tui.py --status --json       # Show machine-readable JSON status
+    python tui.py --start               # Start training headlessly
+    python tui.py --confirm             # Confirm current session headlessly
+    python tui.py --stop                # Stop training headlessly
+    python tui.py --done                # Signal training complete, rotate to next
+    python tui.py --schema <platform>   # Print credential schema for a platform
+    python tui.py --platforms           # List all platforms + required fields + AUTO/MANUAL
 
 Slash Commands:
     /add         → Pick platform → Enter credentials → See detail + stack accounts
@@ -933,6 +940,7 @@ class FreeGPUTrainerApp(App):
             "start": self._cmd_start,
             "confirm": self._cmd_confirm,
             "stop": self._cmd_stop,
+            "done": self._cmd_done,
             "status": self._cmd_status,
             "save": self._cmd_save,
             "reset": self._cmd_reset,
@@ -1196,10 +1204,13 @@ class FreeGPUTrainerApp(App):
                 self._log(f"[green]ROTATED:[/green] {old.platform.name}/{old.account.name} -> "
                           f"{new.platform.name}/{new.account.name}")
                 self._gen_script(new)
-                # Auto-confirm for auto-platforms
+                # Auto-confirm for auto-platforms (Kaggle uses delayed polling)
                 if is_auto_platform(new.platform.key):
-                    self.session_manager.confirm_session()
-                    self._log("[green]Auto-confirmed[/green] (API/SSH platform)")
+                    self.session_manager._auto_confirm_with_polling(new)
+                    if new.platform.key == "kaggle":
+                        self._log("[green]Auto-confirming[/green] — polling Kaggle until running...")
+                    else:
+                        self._log("[green]Auto-confirmed[/green] (API/SSH platform)")
             else:
                 self._log("[red]No account for rotation![/red] Stopped.")
 
@@ -1212,10 +1223,13 @@ class FreeGPUTrainerApp(App):
             # Push code via handler
             self._gen_script(session)
 
-            # Auto-confirm for auto-platforms (Kaggle, SSH)
+            # Auto-confirm for auto-platforms (Kaggle uses delayed polling, SSH immediate)
             if is_auto_platform(session.platform.key):
-                self.session_manager.confirm_session()
-                self._log("[green]Auto-confirmed[/green] — countdown timer started")
+                self.session_manager._auto_confirm_with_polling(session)
+                if session.platform.key == "kaggle":
+                    self._log("[green]Auto-confirming[/green] — polling Kaggle until kernel is running...")
+                else:
+                    self._log("[green]Auto-confirmed[/green] — countdown timer started")
             elif session.platform.key == "huggingface":
                 self._log("[yellow]HuggingFace Spaces are for inference/demos, NOT long training.[/yellow]")
                 self._log("[yellow]Run /confirm once your Space is running.[/yellow]")
@@ -1244,6 +1258,21 @@ class FreeGPUTrainerApp(App):
                       f"auto-rotate: {self.session_manager.auto_rotate}[/dim]")
         else:
             self._log("[red]Failed to confirm session[/red]")
+
+    def _cmd_done(self):
+        """Signal training complete — end session early and rotate."""
+        if not self.session_manager or not self.session_manager.is_training:
+            self._log("[yellow]No active training session[/yellow]")
+            return
+
+        session = self.session_manager.current_session
+        self._log(f"[green]Training complete:[/green] ending {session.platform.name}/{session.account.name} early")
+        rotated = self.session_manager.mark_training_complete()
+        if rotated:
+            self._log("[green]Rotated to next account[/green]")
+        else:
+            self._log("[yellow]No more accounts to rotate to[/yellow]")
+            self.training_active = False
 
     def _cmd_stop(self):
         if self.session_manager and self.session_manager.current_session:
@@ -1306,6 +1335,12 @@ class FreeGPUTrainerApp(App):
 
     def _cmd_help(self):
         self.push_screen(HelpScreen())
+
+    def _cmd_save_state(self):
+        """Manually save runtime state to disk."""
+        if self.session_manager:
+            self.session_manager.save_runtime_state()
+            self._log("[green]Runtime state saved to state.json[/green]")
 
     # ── Training Actions ────────────────────────────────────────
 
@@ -1376,24 +1411,317 @@ class FreeGPUTrainerApp(App):
 
 
 def run_app():
-    config_path = "config.yaml"
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--status":
-            config = load_config(config_path)
-            platforms = []
-            for key, cfg in config.get("platforms", {}).items():
-                if key in PLATFORM_DEFS:
-                    platforms.append(build_platform(key, cfg))
-            sm = SessionManager(platforms)
+    """Main entry point — supports both TUI and headless CLI modes."""
+    import argparse
+    import json as _json
+
+    parser = argparse.ArgumentParser(
+        description="Free GPU Trainer — continuous AI training across free GPU platforms",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  python tui.py                       # Launch interactive TUI
+  python tui.py --status              # Human-readable status
+  python tui.py --status --json       # Machine-readable JSON (for agents)
+  python tui.py --start               # Start training headlessly
+  python tui.py --confirm             # Confirm current session headlessly
+  python tui.py --stop                # Stop training headlessly
+  python tui.py --done                # Signal training complete, rotate to next
+  python tui.py --schema kaggle       # Print credential schema for a platform
+  python tui.py --platforms           # List all platforms + required fields + AUTO/MANUAL
+"""
+    )
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--status", action="store_true", help="Show status and exit")
+    parser.add_argument("--json", action="store_true", help="Output as JSON (use with --status)")
+    parser.add_argument("--start", action="store_true", help="Start training headlessly")
+    parser.add_argument("--confirm", action="store_true", help="Confirm current session headlessly")
+    parser.add_argument("--stop", action="store_true", help="Stop training headlessly")
+    parser.add_argument("--done", action="store_true", help="Signal training complete, rotate to next")
+    parser.add_argument("--schema", type=str, default=None, metavar="PLATFORM",
+                        help="Print credential schema for a platform (e.g. kaggle, oracle_cloud)")
+    parser.add_argument("--platforms", action="store_true",
+                        help="List all platforms + required fields + AUTO/MANUAL type")
+
+    args = parser.parse_args()
+    config_path = args.config
+
+    # ── --schema: Print credential schema for a platform ─────────
+    if args.schema:
+        key = args.schema
+        if key not in PLATFORM_DEFS:
+            print(f"Error: Unknown platform '{key}'. Available: {', '.join(PLATFORM_DEFS.keys())}")
+            sys.exit(1)
+        schema = {
+            "platform": key,
+            "name": PLATFORM_DEFS[key]["name"],
+            "type": "AUTO" if key in {"kaggle", "oracle_cloud", "gcp"} else "MANUAL",
+            "url": PLATFORM_DEFS[key]["url"],
+            "gpu_type": PLATFORM_DEFS[key]["gpu_type"],
+            "session_limit_hours": PLATFORM_DEFS[key]["session_limit_hours"],
+            "credentials": CREDENTIAL_SCHEMAS.get(key, []),
+        }
+        if args.json:
+            print(_json.dumps(schema, indent=2))
+        else:
+            print(f"\n  Platform: {schema['name']} ({key})")
+            print(f"  Type: {schema['type']}")
+            print(f"  GPU: {schema['gpu_type']}")
+            print(f"  Session limit: {schema['session_limit_hours']}h")
+            print(f"  URL: {schema['url']}")
+            if schema["credentials"]:
+                print(f"\n  Required credentials:")
+                for cf in schema["credentials"]:
+                    req = "required" if cf.get("required", True) else "optional"
+                    secret = " (secret)" if cf.get("secret", False) else ""
+                    print(f"    {cf['key']:25s} — {cf['label']} [{req}{secret}]")
+                    if cf.get("hint"):
+                        print(f"      Hint: {cf['hint']}")
+            else:
+                print(f"\n  No credentials required")
+            print()
+        return
+
+    # ── --platforms: List all platforms ──────────────────────────
+    if args.platforms:
+        if args.json:
+            platforms_list = []
+            for key, defn in PLATFORM_DEFS.items():
+                ptype = "AUTO" if key in {"kaggle", "oracle_cloud", "gcp"} else "MANUAL"
+                platforms_list.append({
+                    "key": key,
+                    "name": defn["name"],
+                    "type": ptype,
+                    "url": defn["url"],
+                    "gpu_type": defn["gpu_type"],
+                    "session_limit_hours": defn["session_limit_hours"],
+                    "weekly_limit_hours": defn.get("weekly_limit_hours"),
+                    "credentials": [cf["key"] for cf in CREDENTIAL_SCHEMAS.get(key, [])],
+                })
+            print(_json.dumps(platforms_list, indent=2))
+        else:
+            print(f"\n  {'Platform':35s} {'Type':8s} {'GPU':20s} {'Session':8s} {'Creds':6s}")
+            print(f"  {'─'*35} {'─'*8} {'─'*20} {'─'*8} {'─'*6}")
+            for key, defn in PLATFORM_DEFS.items():
+                ptype = "AUTO" if key in {"kaggle", "oracle_cloud", "gcp"} else "MANUAL"
+                cred_count = len(CREDENTIAL_SCHEMAS.get(key, []))
+                cred_str = str(cred_count) if cred_count else "-"
+                print(f"  {defn['name']:35s} {ptype:8s} {defn['gpu_type']:20s} {defn['session_limit_hours']:5.0f}h   {cred_str:6s}")
+            print()
+        return
+
+    # ── Load config and build SessionManager for CLI commands ────
+    def _build_sm(config_path):
+        config = load_config(config_path)
+        platforms = []
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        for key, cfg in config.get("platforms", {}).items():
+            if key in PLATFORM_DEFS:
+                platforms.append(build_platform(key, cfg, config_dir))
+        tc = config.get("training", {})
+        sm = SessionManager(
+            platforms=platforms,
+            auto_rotate=tc.get("auto_rotate", True),
+            rotate_buffer_minutes=tc.get("rotate_buffer_minutes", 10),
+            checkpoint_before_rotate=tc.get("checkpoint_before_rotate", True),
+            entry_script=tc.get("entry_script", "train.py"),
+        )
+        return sm, config
+
+    # ── --status: Show status ────────────────────────────────────
+    if args.status:
+        sm, config = _build_sm(config_path)
+        if args.json:
+            print(_json.dumps(sm.get_status_json(), indent=2))
+        else:
             print(f"\n  Free GPU Trainer — Status\n")
-            print(f"  Total: {sm.get_total_available_hours():.1f}h  Platforms: {len(platforms)}")
-            for p in platforms:
+            print(f"  Total: {sm.get_total_available_hours():.1f}h  Platforms: {len(sm.platforms)}")
+            for p in sm.platforms:
                 ptype = platform_type_label(p.key)
                 print(f"    {p.name:35s} ({p.gpu_type:20s}) {p.total_accounts}x = {p.max_continuous_hours:.0f}h  [{ptype}]")
+            if sm.current_session and sm.current_session.is_active:
+                s = sm.current_session
+                phase = s.phase.value.upper()
+                print(f"\n  Current: [{phase}] {s.platform.name}/{s.account.name} {s.platform.gpu_type}")
+                if s.is_confirmed:
+                    print(f"           Elapsed: {format_seconds(s.elapsed_seconds)}  Remaining: {format_seconds(s.remaining_seconds)}")
             print()
-            return
-        elif sys.argv[1] == "--config":
-            config_path = sys.argv[2] if len(sys.argv) > 2 else "config.yaml"
+        return
+
+    # ── --start: Start training headlessly ───────────────────────
+    if args.start:
+        sm, config = _build_sm(config_path)
+        if sm.is_training:
+            s = sm.current_session
+            result = sm.get_status_json()
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "already_training", "session": result.get("current_session")}, indent=2))
+            else:
+                print(f"Already training: {s.platform.name}/{s.account.name} ({s.phase.value})")
+            sys.exit(1)
+
+        session = sm.start_session()
+        if not session:
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "no_accounts"}, indent=2))
+            else:
+                print("No accounts available. Add platforms and accounts to config.yaml first.")
+            sys.exit(1)
+
+        # Push code via handler
+        from handlers import get_handler as _get_handler
+        handler = _get_handler(session.platform.key)
+        push_result = {"ok": False, "message": "No handler"}
+        if handler:
+            tc = config.get("training", {})
+            script_path = tc.get("entry_script", "train.py")
+            checkpoint_dir = tc.get("checkpoint_dir", "./checkpoints")
+            push_result = handler.push_code(session.account, script_path, checkpoint_dir)
+
+        # Auto-confirm for AUTO platforms
+        if is_auto_platform(session.platform.key):
+            sm._auto_confirm_with_polling(session)
+
+        result = {
+            "ok": True,
+            "session": {
+                "platform": session.platform.key,
+                "platform_name": session.platform.name,
+                "account": session.account.name,
+                "gpu_type": session.platform.gpu_type,
+                "phase": session.phase.value,
+                "type": "AUTO" if is_auto_platform(session.platform.key) else "MANUAL",
+            },
+            "push": {"ok": push_result.get("ok", False), "message": push_result.get("message", "")},
+        }
+        # Save state
+        sm.save_runtime_state()
+
+        if args.json:
+            print(_json.dumps(result, indent=2))
+        else:
+            ptype = "AUTO" if is_auto_platform(session.platform.key) else "MANUAL"
+            print(f"Session created: {session.platform.name}/{session.account.name} ({session.platform.gpu_type}, {ptype})")
+            print(f"  Phase: {session.phase.value}")
+            if is_auto_platform(session.platform.key):
+                if session.platform.key == "kaggle":
+                    print(f"  Status: Polling Kaggle until kernel is running...")
+                else:
+                    print(f"  Status: Auto-confirmed — countdown started")
+            else:
+                print(f"  Status: PENDING — run 'python tui.py --confirm' after uploading notebook")
+            print(f"  Push: {push_result.get('message', 'N/A')}")
+        return
+
+    # ── --confirm: Confirm current session headlessly ────────────
+    if args.confirm:
+        sm, config = _build_sm(config_path)
+        if not sm.current_session or not sm.current_session.is_pending:
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "no_pending_session"}, indent=2))
+            else:
+                print("No pending session to confirm")
+            sys.exit(1)
+
+        if sm.confirm_session():
+            s = sm.current_session
+            sm.save_runtime_state()
+            result = {
+                "ok": True,
+                "session": {
+                    "platform": s.platform.key,
+                    "account": s.account.name,
+                    "phase": s.phase.value,
+                    "remaining_seconds": round(s.remaining_seconds, 1),
+                }
+            }
+            if args.json:
+                print(_json.dumps(result, indent=2))
+            else:
+                print(f"Confirmed: {s.platform.name}/{s.account.name} — countdown started ({s.platform.session_limit_hours}h)")
+        else:
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "confirm_failed"}, indent=2))
+            else:
+                print("Failed to confirm session")
+            sys.exit(1)
+        return
+
+    # ── --stop: Stop training headlessly ─────────────────────────
+    if args.stop:
+        sm, config = _build_sm(config_path)
+        if not sm.is_training:
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "not_training"}, indent=2))
+            else:
+                print("Not currently training")
+            sys.exit(1)
+
+        s = sm.current_session
+        info = {
+            "platform": s.platform.key,
+            "account": s.account.name,
+            "elapsed_seconds": round(s.elapsed_seconds, 1),
+        }
+
+        # Try handler stop
+        from handlers import get_handler as _get_handler
+        handler = _get_handler(s.platform.key)
+        if handler:
+            handler.stop_session(s.account, sm.entry_script)
+
+        sm.stop()
+        sm.save_runtime_state()
+
+        result = {"ok": True, "stopped_session": info}
+        if args.json:
+            print(_json.dumps(result, indent=2))
+        else:
+            print(f"Stopped: {info['platform']}/{info['account']} (elapsed: {format_seconds(info['elapsed_seconds'])})")
+        return
+
+    # ── --done: Signal training complete, rotate ─────────────────
+    if args.done:
+        sm, config = _build_sm(config_path)
+        if not sm.is_training:
+            if args.json:
+                print(_json.dumps({"ok": False, "error": "not_training"}, indent=2))
+            else:
+                print("Not currently training")
+            sys.exit(1)
+
+        rotated = sm.mark_training_complete()
+        sm.save_runtime_state()
+
+        if rotated:
+            new_s = sm.current_session
+            result = {
+                "ok": True,
+                "rotated": True,
+                "new_session": {
+                    "platform": new_s.platform.key,
+                    "account": new_s.account.name,
+                    "phase": new_s.phase.value,
+                    "type": "AUTO" if is_auto_platform(new_s.platform.key) else "MANUAL",
+                } if new_s and new_s.is_active else None,
+            }
+        else:
+            result = {"ok": True, "rotated": False, "message": "No more accounts to rotate to"}
+
+        if args.json:
+            print(_json.dumps(result, indent=2))
+        else:
+            if rotated:
+                if sm.current_session and sm.current_session.is_active:
+                    ns = sm.current_session
+                    print(f"Training complete — rotated to {ns.platform.name}/{ns.account.name}")
+                else:
+                    print(f"Training complete — no more accounts")
+            else:
+                print(f"Training complete — no accounts available for rotation")
+        return
+
+    # ── Default: Launch TUI ──────────────────────────────────────
     app = FreeGPUTrainerApp(config_path=config_path)
     app.run()
 

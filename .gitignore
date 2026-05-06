@@ -1,15 +1,52 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-checkpoints/
+*.pyd
 *.egg-info/
 dist/
 build/
-run_session.sh
-*.ipynb
-trainer.log
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials — NEVER commit these
+.env
+.env.*
+!.env.example
+.master_key
+*.key
+*.pem
+*.pub
 config.yaml
 config.yaml.bak
-*.key
-.master_key
-.env
+config.local.yaml
+
+# Runtime state
+checkpoints/
+state.json
+trainer.log
+run_session.sh
+
+# Generated notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Training artifacts
+outputs/
+logs/
+wandb/

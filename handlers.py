@@ -14,6 +14,7 @@ Credentials are read from account.credentials dict (set via /add in TUI).
 
 import os
 import re
+import shlex
 import json
 import time
 import logging
@@ -592,6 +593,28 @@ class GoogleColabHandler(PlatformHandler):
     key = "google_colab"
     name = "Google Colab"
 
+    def _scan_for_secrets(self, content: str) -> list[str]:
+        """Scan script content for common secret patterns.
+
+        Returns a list of warning messages (empty = no secrets found).
+        """
+        patterns = {
+            "API key": re.compile(r"api_key\s*=\s*['\"][a-zA-Z0-9_\-]{20,}['\"]", re.IGNORECASE),
+            "Token/Bearer/Auth": re.compile(r"(token|bearer|auth)\s*[:=]\s*['\"][a-zA-Z0-9_\-]{20,}['\"]", re.IGNORECASE),
+            "Password/Secret": re.compile(r"(password|passwd|secret)\s*[:=]\s*['\"].{8,}['\"]", re.IGNORECASE),
+            "AWS Access Key": re.compile(r"AKIA[0-9A-Z]{16}"),
+            "Private Key": re.compile(r"-----BEGIN (RSA |EC )?PRIVATE KEY-----"),
+            "Env Secret (HF_TOKEN, OPENAI_API_KEY, etc.)": re.compile(
+                r"(HF_TOKEN|OPENAI_API_KEY|KAGGLE_KEY|AWS_SECRET|GCP_KEY)\s*=",
+                re.IGNORECASE,
+            ),
+        }
+        warnings = []
+        for label, pattern in patterns.items():
+            if pattern.search(content):
+                warnings.append(f"Potential {label} detected")
+        return warnings
+
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
         script = Path(script_path)
         if not script.exists():
@@ -599,7 +622,26 @@ class GoogleColabHandler(PlatformHandler):
 
         script_content = script.read_text()
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
-        notebook = self._generate_notebook(script_content, checkpoint_dir, safe_name)
+
+        # Scan for secrets before embedding the script into the notebook
+        secret_warnings = self._scan_for_secrets(script_content)
+        secrets_warning = None
+        if secret_warnings:
+            logger.warning(
+                "Secrets detected in %s: %s — script will NOT be embedded",
+                script_path, "; ".join(secret_warnings),
+            )
+            secrets_warning = "⚠ Training script not embedded (potential secrets detected). Upload script manually."
+            # Replace the script content with a safe loader stub so the notebook
+            # references the script by filename instead of embedding source.
+            script_name = script.name
+            script_content = (
+                f"# Script not embedded due to detected secrets.\n"
+                f"# Upload {script_name} manually and run:\n"
+                f"!python {script_name} --checkpoint-dir ./checkpoints"
+            )
+
+        notebook = self._generate_notebook(script_content, checkpoint_dir, safe_name, secrets_warning=secrets_warning)
         nb_path = Path(f"colab_{safe_name}_training.ipynb")
         nb_path.write_text(json.dumps(notebook, indent=2))
 
@@ -613,15 +655,18 @@ class GoogleColabHandler(PlatformHandler):
         except FileNotFoundError:
             pass
 
-        return {
+        result = {
             "ok": True,
             "message": f"Notebook generated: {nb_path} — open in Colab and run",
             "notebook_path": str(nb_path),
             "manual": True,
             "url": "https://colab.research.google.com/",
         }
+        if secrets_warning:
+            result["secrets_warning"] = secrets_warning
+        return result
 
-    def _generate_notebook(self, script_content: str, checkpoint_dir: str, account_name: str) -> dict:
+    def _generate_notebook(self, script_content: str, checkpoint_dir: str, account_name: str, *, secrets_warning: str | None = None) -> dict:
         cells = [
             {
                 "cell_type": "markdown",
@@ -656,7 +701,28 @@ class GoogleColabHandler(PlatformHandler):
                 "execution_count": None,
                 "outputs": [],
             },
-            {
+        ]
+
+        if secrets_warning:
+            # Add a markdown warning cell and a safe !python command cell
+            cells.append({
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [secrets_warning],
+            })
+            cells.append({
+                "cell_type": "code",
+                "metadata": {"id": "training"},
+                "source": [
+                    "# Training Script (run via command — source not embedded)\n",
+                    script_content,
+                ],
+                "execution_count": None,
+                "outputs": [],
+            })
+        else:
+            # Embed the full training script source
+            cells.append({
                 "cell_type": "code",
                 "metadata": {"id": "training"},
                 "source": [
@@ -665,8 +731,8 @@ class GoogleColabHandler(PlatformHandler):
                 ],
                 "execution_count": None,
                 "outputs": [],
-            },
-        ]
+            })
+
         return {
             "nbformat": 4, "nbformat_minor": 0,
             "metadata": {
@@ -775,10 +841,11 @@ class OracleCloudHandler(PlatformHandler):
         safe_host, safe_user, expanded_key = safe
         # Use the basename of entry_script so it matches the SCP'd file
         script_name = Path(entry_script).name
+        quoted_name = shlex.quote(script_name)
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"nohup python ~/{script_name} > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{quoted_name} > ~/training.log 2>&1 & echo $! > ~/training.pid"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -792,14 +859,13 @@ class OracleCloudHandler(PlatformHandler):
         if not safe:
             return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
         safe_host, safe_user, expanded_key = safe
-        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"ps aux | grep {script_name} | grep -v grep || echo 'not running'"],
+                 "if [ -f ~/training.pid ] && kill -0 $(cat ~/training.pid) 2>/dev/null; then echo 'running'; else echo 'not running'; fi"],
                 capture_output=True, text=True, timeout=10,
             )
-            running = script_name in result.stdout and "not running" not in result.stdout
+            running = "running" in result.stdout and "not running" not in result.stdout
             return {"ok": True, "status": "running" if running else "stopped", "message": result.stdout.strip()}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
@@ -809,10 +875,10 @@ class OracleCloudHandler(PlatformHandler):
         if not safe:
             return {"ok": True, "message": "No valid SSH config — stop manually"}
         safe_host, safe_user, expanded_key = safe
-        script_name = Path(entry_script).name
         try:
             subprocess.run(
-                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", f"pkill -f {script_name}"],
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
+                 "kill $(cat ~/training.pid 2>/dev/null) 2>/dev/null; rm -f ~/training.pid"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}
@@ -902,10 +968,11 @@ class GCPHandler(PlatformHandler):
         safe_host, safe_user, expanded_key = safe
         # Use the basename of entry_script so it matches the SCP'd file
         script_name = Path(entry_script).name
+        quoted_name = shlex.quote(script_name)
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"nohup python ~/{script_name} > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{quoted_name} > ~/training.log 2>&1 & echo $! > ~/training.pid"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -919,14 +986,13 @@ class GCPHandler(PlatformHandler):
         if not safe:
             return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
         safe_host, safe_user, expanded_key = safe
-        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"ps aux | grep {script_name} | grep -v grep || echo 'not running'"],
+                 "if [ -f ~/training.pid ] && kill -0 $(cat ~/training.pid) 2>/dev/null; then echo 'running'; else echo 'not running'; fi"],
                 capture_output=True, text=True, timeout=10,
             )
-            running = script_name in result.stdout and "not running" not in result.stdout
+            running = "running" in result.stdout and "not running" not in result.stdout
             return {"ok": True, "status": "running" if running else "stopped", "message": result.stdout.strip()}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
@@ -936,10 +1002,10 @@ class GCPHandler(PlatformHandler):
         if not safe:
             return {"ok": True, "message": "No valid SSH config — stop manually"}
         safe_host, safe_user, expanded_key = safe
-        script_name = Path(entry_script).name
         try:
             subprocess.run(
-                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", f"pkill -f {script_name}"],
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
+                 "kill $(cat ~/training.pid 2>/dev/null) 2>/dev/null; rm -f ~/training.pid"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}

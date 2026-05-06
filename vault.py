@@ -6,7 +6,7 @@ Fernet symmetric encryption with a master key stored in .master_key.
 Security model:
   - Preferred: OS keychain via `keyring` (credentials never touch disk as plaintext)
   - Fallback: Fernet encryption (cryptography library) with .master_key file
-  - If neither is available: plaintext warning + save anyway (with loud log)
+  - If neither is available: raises RuntimeError (refuses to save)
 
 Usage in config.yaml:
   credentials:
@@ -152,7 +152,7 @@ def encrypt_credentials(platform_key: str, account_name: str, creds: dict, confi
     Strategy:
     1. Try OS keyring (best — creds never on disk)
     2. Fallback: Fernet-encrypt values in config.yaml
-    3. Last resort: plaintext with warning
+    3. No encryption available: raises RuntimeError (refuses to save)
 
     Returns dict suitable for config.yaml (encrypted values if using Fernet,
     or empty dict if keyring handled it).
@@ -178,14 +178,12 @@ def encrypt_credentials(platform_key: str, account_name: str, creds: dict, confi
         logger.debug(f"Credentials Fernet-encrypted for {platform_key}/{account_name}")
         return encrypted
 
-    # Plaintext fallback — loud warning
-    logger.warning(
-        f"⚠ No encryption available! Credentials for {platform_key}/{account_name} "
-        f"stored in PLAINTEXT. Install 'keyring' or 'cryptography' for encryption."
+    # No encryption available — REFUSE to save plaintext
+    raise RuntimeError(
+        f"Cannot save credentials for {platform_key}/{account_name}: "
+        f"no encryption available. Install 'keyring' or 'cryptography' "
+        f"to enable secure credential storage."
     )
-    result = dict(creds)
-    result["_storage"] = "plain"
-    return result
 
 
 def decrypt_credentials(platform_key: str, account_name: str, stored: dict, config_dir: str = ".") -> dict:
@@ -239,4 +237,4 @@ def get_storage_mode() -> str:
         return "OS Keychain (keyring)"
     if _has_cryptography():
         return "Fernet Encryption (.master_key)"
-    return "⚠ PLAINTEXT (install keyring or cryptography)"
+    return "❌ NO ENCRYPTION (install keyring or cryptography to save credentials)"
