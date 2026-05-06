@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.checkpoints/
+*.egg-info/
+dist/
+build/
+.run_session.sh
+.run_session_notebook.py
+trainer.log
