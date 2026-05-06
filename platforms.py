@@ -352,13 +352,21 @@ PLATFORM_DEFS: dict[str, dict] = {
 }
 
 
-def build_platform(key: str, cfg: dict) -> PlatformConfig:
-    """Build a PlatformConfig from YAML config + platform definition."""
+def build_platform(key: str, cfg: dict, config_dir: str = ".") -> PlatformConfig:
+    """Build a PlatformConfig from YAML config + platform definition.
+
+    Credentials are decrypted from storage (keyring/Fernet) before use.
+    """
+    from vault import decrypt_credentials
     defn = PLATFORM_DEFS[key]
     accounts = []
     for ac in cfg.get("accounts", []):
-        # Extract credentials from account config
-        creds = ac.get("credentials", {})
+        # Extract and decrypt credentials from stored form
+        stored_creds = ac.get("credentials", {})
+        if stored_creds:
+            creds = decrypt_credentials(key, ac["name"], stored_creds, config_dir)
+        else:
+            creds = {}
         # Also support legacy token/api_key fields
         if ac.get("token") and "token" not in creds:
             creds["token"] = ac["token"]

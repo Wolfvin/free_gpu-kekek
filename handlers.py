@@ -13,6 +13,7 @@ Credentials are read from account.credentials dict (set via /add in TUI).
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -20,6 +21,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 from abc import ABC, abstractmethod
+from functools import wraps
 
 logger = logging.getLogger("fgt.handler")
 
@@ -38,6 +40,114 @@ def _cred(account, key: str, env_var: str = "", default: str = "") -> str:
     return default
 
 
+# ── Input Validation ──────────────────────────────────────────────
+
+# Valid hostname: alphanumeric + dots + hyphens, no leading hyphen, no spaces
+_RE_HOSTNAME = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.\-]*[a-zA-Z0-9])?$')
+# Valid IP address (v4)
+_RE_IPV4 = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+# Valid SSH username: alphanumeric + underscore + hyphen
+_RE_SSH_USER = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9_.\-]*$')
+# Valid account name: alphanumeric + hyphen + underscore
+_RE_ACCOUNT_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\-]*$')
+
+
+def validate_hostname(host: str) -> bool:
+    """Validate a hostname or IP address."""
+    if not host:
+        return False
+    if _RE_IPV4.match(host):
+        return True
+    if _RE_HOSTNAME.match(host) and len(host) <= 253:
+        return True
+    return False
+
+
+def validate_ssh_user(user: str) -> bool:
+    """Validate an SSH username."""
+    return bool(_RE_SSH_USER.match(user)) and len(user) <= 64
+
+
+def validate_account_name(name: str) -> tuple[bool, str]:
+    """Validate an account name. Returns (is_valid, error_message)."""
+    if not name:
+        return False, "Account name cannot be empty"
+    if len(name) > 64:
+        return False, "Account name too long (max 64 characters)"
+    if not _RE_ACCOUNT_NAME.match(name):
+        return False, "Account name can only contain letters, numbers, hyphens, and underscores (must start with alphanumeric)"
+    return True, ""
+
+
+# ── Retry Logic ───────────────────────────────────────────────────
+
+def with_retry(max_retries: int = 3, base_delay: float = 1.0, backoff: float = 2.0):
+    """Decorator for API calls with exponential backoff retry.
+
+    Retries on:
+      - subprocess.TimeoutExpired
+      - ConnectionError / ConnectionRefusedError
+      - Any exception with 'rate' or 'timeout' in the message
+
+    Does NOT retry on:
+      - FileNotFoundError (missing binary)
+      - Authentication failures
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except subprocess.TimeoutExpired as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (backoff ** attempt)
+                        logger.warning(f"Timeout on attempt {attempt + 1}/{max_retries}, retrying in {delay:.1f}s: {e}")
+                        time.sleep(delay)
+                except (ConnectionError, ConnectionRefusedError, OSError) as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (backoff ** attempt)
+                        logger.warning(f"Connection error on attempt {attempt + 1}/{max_retries}, retrying in {delay:.1f}s: {e}")
+                        time.sleep(delay)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if any(kw in msg for kw in ['rate', 'timeout', '429', '503', 'temporarily']):
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (backoff ** attempt)
+                            logger.warning(f"Retryable error on attempt {attempt + 1}/{max_retries}, retrying in {delay:.1f}s: {e}")
+                            time.sleep(delay)
+                    else:
+                        raise  # Non-retryable error
+            # All retries exhausted
+            if last_error:
+                raise last_error
+        return wrapper
+    return decorator
+
+
+# ── SSH Safety Helper ─────────────────────────────────────────────
+
+def _safe_ssh_args(host: str, user: str, key_file: str) -> Optional[tuple]:
+    """Validate and build safe SSH arguments.
+
+    Returns (safe_host, safe_user, expanded_key) or None if invalid.
+    """
+    if not validate_hostname(host):
+        logger.error(f"Invalid SSH host: {host!r}")
+        return None
+    if not validate_ssh_user(user):
+        logger.error(f"Invalid SSH user: {user!r}")
+        return None
+    expanded_key = os.path.expanduser(key_file)
+    if not os.path.exists(expanded_key):
+        logger.warning(f"SSH key not found: {expanded_key}")
+    return (host, user, expanded_key)
+
+
 # ── Base Handler ───────────────────────────────────────────────────
 
 class PlatformHandler(ABC):
@@ -48,30 +158,24 @@ class PlatformHandler(ABC):
 
     @abstractmethod
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Push training code to the platform."""
         pass
 
     @abstractmethod
     def start_session(self, account) -> dict:
-        """Start a training session."""
         pass
 
     @abstractmethod
     def check_status(self, account) -> dict:
-        """Check session status."""
         pass
 
     @abstractmethod
     def stop_session(self, account) -> dict:
-        """Stop a running session."""
         pass
 
     def is_available(self, account) -> dict:
-        """Check if the platform is accessible right now."""
         return {"ok": True, "message": "Unknown", "available": None}
 
     def get_gpu_info(self, account) -> dict:
-        """Get GPU info."""
         return {"ok": True, "gpu": "Unknown"}
 
 
@@ -79,11 +183,6 @@ class PlatformHandler(ABC):
 
 class KaggleHandler(PlatformHandler):
     """Kaggle Notebooks API handler.
-
-    Uses the kaggle Python package to:
-    - Push notebooks via `kaggle kernels push`
-    - Check status via `kaggle kernels status`
-    - Pull output via `kaggle kernels output`
 
     Auth: account.credentials = {"kaggle_username": "...", "kaggle_key": "..."}
     Or set KAGGLE_USERNAME and KAGGLE_KEY env vars.
@@ -95,7 +194,6 @@ class KaggleHandler(PlatformHandler):
     def _get_client(self, account):
         """Get authenticated Kaggle API client."""
         try:
-            # Read credentials from account first, then env vars
             username = _cred(account, "kaggle_username", "KAGGLE_USERNAME")
             key = _cred(account, "kaggle_key", "KAGGLE_KEY")
 
@@ -104,10 +202,8 @@ class KaggleHandler(PlatformHandler):
             if key:
                 os.environ["KAGGLE_KEY"] = key
 
-            # Check if credentials exist
             has_creds = bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"))
             if not has_creds:
-                # Also check ~/.kaggle/kaggle.json
                 kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
                 if kaggle_json.exists():
                     has_creds = True
@@ -125,8 +221,8 @@ class KaggleHandler(PlatformHandler):
             logger.debug(f"Kaggle auth failed for {account.name}: {e}")
             return None
 
+    @with_retry(max_retries=2, base_delay=2.0)
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Push a training script as a Kaggle kernel."""
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Kaggle auth failed. Set credentials via /add or KAGGLE_USERNAME + KAGGLE_KEY env vars."}
@@ -135,12 +231,16 @@ class KaggleHandler(PlatformHandler):
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
-        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME", "user")
+        username = os.environ.get("KAGGLE_USERNAME", "")
+        if not username:
+            return {"ok": False, "message": "KAGGLE_USERNAME not set — cannot determine kernel owner"}
 
-        # Create kernel metadata
+        # Sanitize account name for kernel slug
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+
         kernel_meta = {
-            "id": f"{username}/{account.name}-training",
-            "title": f"{account.name}-training",
+            "id": f"{username}/{safe_name}-training",
+            "title": f"{safe_name}-training",
             "code_file": str(script),
             "language": "python",
             "kernel_type": "script",
@@ -152,7 +252,6 @@ class KaggleHandler(PlatformHandler):
             "kernel_sources": [],
         }
 
-        # Write metadata
         meta_path = script.parent / "kernel-metadata.json"
         with open(meta_path, "w") as f:
             json.dump(kernel_meta, f, indent=2)
@@ -174,17 +273,20 @@ class KaggleHandler(PlatformHandler):
             return {"ok": False, "message": f"Push error: {e}"}
 
     def start_session(self, account) -> dict:
-        """Start a Kaggle kernel session (push = start on Kaggle)."""
         return self.push_code(account, "train.py")
 
+    @with_retry(max_retries=2, base_delay=2.0)
     def check_status(self, account) -> dict:
-        """Check kernel status via kaggle API."""
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed", "status": "unknown"}
 
-        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME", "user")
-        slug = f"{account.name}-training"
+        username = os.environ.get("KAGGLE_USERNAME", "")
+        if not username:
+            return {"ok": False, "message": "KAGGLE_USERNAME not set", "status": "unknown"}
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+        slug = f"{safe_name}-training"
         try:
             result = subprocess.run(
                 ["kaggle", "kernels", "status", f"{username}/{slug}"],
@@ -196,11 +298,9 @@ class KaggleHandler(PlatformHandler):
             return {"ok": False, "message": str(e), "status": "error"}
 
     def stop_session(self, account) -> dict:
-        """Kaggle doesn't support stopping kernels via API — they auto-timeout."""
         return {"ok": True, "message": "Kaggle kernels auto-stop after session limit"}
 
     def is_available(self, account) -> dict:
-        """Check if Kaggle API is accessible."""
         api = self._get_client(account)
         if api:
             return {"ok": True, "available": True, "message": "Kaggle API authenticated"}
@@ -212,11 +312,6 @@ class KaggleHandler(PlatformHandler):
 class HuggingFaceHandler(PlatformHandler):
     """HuggingFace Spaces/ZeroGPU handler.
 
-    Uses huggingface_hub to:
-    - Create/manage Spaces with GPU hardware
-    - Upload training code
-    - Start/stop Spaces
-
     Auth: account.credentials = {"hf_token": "..."}
     Or set HF_TOKEN env var.
     """
@@ -225,7 +320,6 @@ class HuggingFaceHandler(PlatformHandler):
     name = "Hugging Face Spaces"
 
     def _get_client(self, account):
-        """Get authenticated HuggingFace API client."""
         try:
             from huggingface_hub import HfApi
             token = _cred(account, "hf_token", "HF_TOKEN")
@@ -237,8 +331,8 @@ class HuggingFaceHandler(PlatformHandler):
             logger.warning(f"HF auth failed for {account.name}: {e}")
             return None
 
+    @with_retry(max_retries=3, base_delay=2.0)
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Push training code to a HuggingFace Space."""
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "HF auth failed. Set HF_TOKEN via /add or env var."}
@@ -247,10 +341,9 @@ class HuggingFaceHandler(PlatformHandler):
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
-        # Generate app.py that wraps the training script as a Gradio app
         app_code = self._generate_gradio_app(script_path, checkpoint_dir)
-
-        repo_name = f"{account.name}-trainer"
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+        repo_name = f"{safe_name}-trainer"
         username = None
         try:
             who = api.whoami()
@@ -262,14 +355,12 @@ class HuggingFaceHandler(PlatformHandler):
         token = _cred(account, "hf_token", "HF_TOKEN")
 
         try:
-            # Try to create the Space (will fail if exists, that's ok)
             try:
                 from huggingface_hub import create_repo
                 create_repo(repo_id=repo_id, repo_type="space", space_sdk="gradio", token=token, exist_ok=True)
             except Exception:
                 pass
 
-            # Upload the training script and app
             import tempfile
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
                 f.write(app_code)
@@ -285,7 +376,6 @@ class HuggingFaceHandler(PlatformHandler):
             return {"ok": False, "message": f"Push error: {e}"}
 
     def _generate_gradio_app(self, script_path: str, checkpoint_dir: str) -> str:
-        """Generate a Gradio app.py that runs the training script."""
         return f'''import gradio as gr
 import subprocess
 import threading
@@ -310,26 +400,25 @@ if __name__ == "__main__":
 '''
 
     def start_session(self, account) -> dict:
-        """Start a HF Space (push code = starts the Space)."""
         return self.push_code(account, "train.py")
 
+    @with_retry(max_retries=2, base_delay=2.0)
     def check_status(self, account) -> dict:
-        """Check Space status."""
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed", "status": "unknown"}
 
         try:
-            from huggingface_hub import SpaceRuntime
-            info = api.space_info(repo_id=f"{api.whoami().get('name', 'user')}/{account.name}-trainer")
+            safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+            info = api.space_info(repo_id=f"{api.whoami().get('name', 'user')}/{safe_name}-trainer")
             runtime = info.runtime if hasattr(info, 'runtime') else None
             stage = runtime.stage if runtime else "unknown"
             return {"ok": True, "status": stage, "message": f"Space status: {stage}"}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
 
+    @with_retry(max_retries=2, base_delay=1.0)
     def stop_session(self, account) -> dict:
-        """Stop a HF Space by pausing it."""
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed"}
@@ -337,7 +426,8 @@ if __name__ == "__main__":
             from huggingface_hub import pause_space
             username = api.whoami().get("name", "user")
             token = _cred(account, "hf_token", "HF_TOKEN")
-            pause_space(f"{username}/{account.name}-trainer", token=token)
+            safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+            pause_space(f"{username}/{safe_name}-trainer", token=token)
             return {"ok": True, "message": "Space paused (GPU freed)"}
         except Exception as e:
             return {"ok": False, "message": f"Stop error: {e}"}
@@ -355,30 +445,26 @@ class GoogleColabHandler(PlatformHandler):
     """Google Colab handler.
 
     Colab has NO public API for creating/managing runtimes.
-    Strategy: Generate notebook + use google-colabtools CLI if available,
-    otherwise generate a .ipynb file the user manually uploads.
+    Generates .ipynb notebooks for manual upload.
 
     Credentials: account.credentials = {"email": "..."}
-    (Colab doesn't use API keys — the email is for identification/rotation tracking)
+    (Colab doesn't use API keys — email is for identification/rotation tracking)
     """
 
     key = "google_colab"
     name = "Google Colab"
 
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Generate a Colab notebook from the training script."""
         script = Path(script_path)
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
         script_content = script.read_text()
-
-        # Generate .ipynb notebook
-        notebook = self._generate_notebook(script_content, checkpoint_dir, account.name)
-        nb_path = Path(f"colab_{account.name}_training.ipynb")
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+        notebook = self._generate_notebook(script_content, checkpoint_dir, safe_name)
+        nb_path = Path(f"colab_{safe_name}_training.ipynb")
         nb_path.write_text(json.dumps(notebook, indent=2))
 
-        # Try to push via colab-cli if available
         try:
             result = subprocess.run(
                 ["colab-cli", "upload", str(nb_path)],
@@ -398,7 +484,6 @@ class GoogleColabHandler(PlatformHandler):
         }
 
     def _generate_notebook(self, script_content: str, checkpoint_dir: str, account_name: str) -> dict:
-        """Generate a Jupyter notebook dict for Colab."""
         cells = [
             {
                 "cell_type": "markdown",
@@ -444,10 +529,8 @@ class GoogleColabHandler(PlatformHandler):
                 "outputs": [],
             },
         ]
-
         return {
-            "nbformat": 4,
-            "nbformat_minor": 0,
+            "nbformat": 4, "nbformat_minor": 0,
             "metadata": {
                 "colab": {"provenance": [], "gpuType": "T4"},
                 "kernelspec": {"name": "python3", "display_name": "Python 3"},
@@ -457,11 +540,9 @@ class GoogleColabHandler(PlatformHandler):
         }
 
     def start_session(self, account) -> dict:
-        """Generate notebook for manual upload."""
         return self.push_code(account, "train.py")
 
     def check_status(self, account) -> dict:
-        """Colab has no status API — user checks manually."""
         return {"ok": True, "status": "unknown", "message": "Colab has no status API — check browser"}
 
     def stop_session(self, account) -> dict:
@@ -477,7 +558,6 @@ class OracleCloudHandler(PlatformHandler):
     """Oracle Cloud Free Tier handler.
 
     Uses SSH to manage always-free Ampere A1 compute instances.
-    Can run Ollama/transformers on the free tier VM.
 
     Auth: account.credentials = {"oci_vm_host": "129.x.x.x", "oci_vm_user": "opc", "oci_ssh_key": "~/.ssh/id_rsa"}
     Or set OCI_VM_HOST, OCI_VM_USER, OCI_SSH_KEY env vars.
@@ -487,68 +567,78 @@ class OracleCloudHandler(PlatformHandler):
     name = "Oracle Cloud Free Tier"
 
     def _ssh_config(self, account) -> tuple:
-        """Get SSH config from account credentials or env vars."""
         host = _cred(account, "oci_vm_host", "OCI_VM_HOST")
         user = _cred(account, "oci_vm_user", "OCI_VM_USER", "opc")
         key_file = _cred(account, "oci_ssh_key", "OCI_SSH_KEY", "~/.ssh/id_rsa")
         return host, user, key_file
 
-    def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
-        """Push training code via SSH to Oracle Cloud VM."""
+    def _validated_ssh(self, account) -> Optional[tuple]:
+        """Validate SSH args and return (host, user, expanded_key) or None."""
         host, user, key_file = self._ssh_config(account)
-
         if not host:
-            return {
-                "ok": True,
-                "message": "Set OCI VM credentials via /add (host, user, SSH key). Manual: scp train.py opc@<vm-ip>:~/",
-                "manual": True,
-            }
+            return None
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return None
+        return safe
 
+    @with_retry(max_retries=2, base_delay=2.0)
+    def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
+        host, user, key_file = self._ssh_config(account)
+        if not host:
+            return {"ok": True, "message": "Set OCI VM credentials via /add", "manual": True}
+
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
+
+        safe_host, safe_user, expanded_key = safe
         script = Path(script_path)
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
         try:
             result = subprocess.run(
-                ["scp", "-i", os.path.expanduser(key_file), str(script), f"{user}@{host}:~/train.py"],
+                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
-                return {"ok": True, "message": f"Pushed to {host}"}
+                return {"ok": True, "message": f"Pushed to {safe_host}"}
             return {"ok": False, "message": f"SCP failed: {result.stderr}"}
         except Exception as e:
             return {"ok": False, "message": f"Push error: {e}"}
 
+    @with_retry(max_retries=2, base_delay=2.0)
     def start_session(self, account) -> dict:
-        """Start training via SSH on Oracle Cloud VM."""
         host, user, key_file = self._ssh_config(account)
-
         if not host:
-            return {
-                "ok": True,
-                "message": "Set OCI VM credentials via /add. Manual: ssh opc@<vm-ip> 'python train.py'",
-                "manual": True,
-            }
+            return {"ok": True, "message": "Set OCI VM credentials via /add", "manual": True}
 
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
+
+        safe_host, safe_user, expanded_key = safe
         try:
             result = subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
                  "nohup python ~/train.py > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
-                return {"ok": True, "message": f"Training started on {host}"}
+                return {"ok": True, "message": f"Training started on {safe_host}"}
             return {"ok": False, "message": f"SSH failed: {result.stderr}"}
         except Exception as e:
             return {"ok": False, "message": f"Start error: {e}"}
 
     def check_status(self, account) -> dict:
-        host, user, key_file = self._ssh_config(account)
-        if not host:
-            return {"ok": True, "status": "unknown", "message": "No OCI VM host configured"}
+        safe = self._validated_ssh(account)
+        if not safe:
+            return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
+        safe_host, safe_user, expanded_key = safe
         try:
             result = subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
                  "ps aux | grep train.py | grep -v grep || echo 'not running'"],
                 capture_output=True, text=True, timeout=10,
             )
@@ -558,12 +648,13 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": str(e), "status": "error"}
 
     def stop_session(self, account) -> dict:
-        host, user, key_file = self._ssh_config(account)
-        if not host:
-            return {"ok": True, "message": "No OCI VM host — stop manually"}
+        safe = self._validated_ssh(account)
+        if not safe:
+            return {"ok": True, "message": "No valid SSH config — stop manually"}
+        safe_host, safe_user, expanded_key = safe
         try:
-            result = subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}", "pkill -f train.py"],
+            subprocess.run(
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", "pkill -f train.py"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}
@@ -586,53 +677,76 @@ class GCPHandler(PlatformHandler):
     name = "Google Cloud Platform"
 
     def _ssh_config(self, account) -> tuple:
-        """Get SSH config from account credentials or env vars."""
         host = _cred(account, "gcp_vm_host", "GCP_VM_HOST")
         user = _cred(account, "gcp_vm_user", "GCP_VM_USER", "ubuntu")
         key_file = _cred(account, "gcp_ssh_key", "GCP_SSH_KEY", "~/.ssh/id_rsa")
         return host, user, key_file
 
+    def _validated_ssh(self, account) -> Optional[tuple]:
+        host, user, key_file = self._ssh_config(account)
+        if not host:
+            return None
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return None
+        return safe
+
+    @with_retry(max_retries=2, base_delay=2.0)
     def push_code(self, account, script_path: str, checkpoint_dir: str = "./checkpoints") -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
             return {"ok": True, "message": "Set GCP VM credentials via /add", "manual": True}
+
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
+
+        safe_host, safe_user, expanded_key = safe
         script = Path(script_path)
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
         try:
             result = subprocess.run(
-                ["scp", "-i", os.path.expanduser(key_file), str(script), f"{user}@{host}:~/train.py"],
+                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
-                return {"ok": True, "message": f"Pushed to {host}"}
+                return {"ok": True, "message": f"Pushed to {safe_host}"}
             return {"ok": False, "message": f"SCP failed: {result.stderr}"}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
+    @with_retry(max_retries=2, base_delay=2.0)
     def start_session(self, account) -> dict:
         host, user, key_file = self._ssh_config(account)
         if not host:
             return {"ok": True, "message": "Set GCP VM credentials via /add", "manual": True}
+
+        safe = _safe_ssh_args(host, user, key_file)
+        if not safe:
+            return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
+
+        safe_host, safe_user, expanded_key = safe
         try:
             result = subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
                  "nohup python ~/train.py > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
-                return {"ok": True, "message": f"Training started on {host}"}
+                return {"ok": True, "message": f"Training started on {safe_host}"}
             return {"ok": False, "message": f"SSH failed: {result.stderr}"}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
     def check_status(self, account) -> dict:
-        host, user, key_file = self._ssh_config(account)
-        if not host:
-            return {"ok": True, "status": "unknown", "message": "No host configured"}
+        safe = self._validated_ssh(account)
+        if not safe:
+            return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
+        safe_host, safe_user, expanded_key = safe
         try:
             result = subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}",
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
                  "ps aux | grep train.py | grep -v grep || echo 'not running'"],
                 capture_output=True, text=True, timeout=10,
             )
@@ -642,12 +756,13 @@ class GCPHandler(PlatformHandler):
             return {"ok": False, "message": str(e), "status": "error"}
 
     def stop_session(self, account) -> dict:
-        host, user, key_file = self._ssh_config(account)
-        if not host:
-            return {"ok": True, "message": "No host — stop manually"}
+        safe = self._validated_ssh(account)
+        if not safe:
+            return {"ok": True, "message": "No valid SSH config — stop manually"}
+        safe_host, safe_user, expanded_key = safe
         try:
             subprocess.run(
-                ["ssh", "-i", os.path.expanduser(key_file), f"{user}@{host}", "pkill -f train.py"],
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", "pkill -f train.py"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}
@@ -661,7 +776,7 @@ class NotebookHandler(PlatformHandler):
     """Handler for notebook-based platforms that don't have push APIs.
 
     Generates .ipynb files for manual upload.
-    Works for: SageMaker Studio Lab, Paperspace, Deepnote, Lightning AI, Codesphere, Intel DevCloud, NVIDIA vGPU
+    Works for: SageMaker, Paperspace, Deepnote, Lightning AI, Codesphere, Intel DevCloud, NVIDIA vGPU
     """
 
     def __init__(self, key: str, name: str, url: str):
@@ -675,8 +790,9 @@ class NotebookHandler(PlatformHandler):
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
         script_content = script.read_text()
-        notebook = self._generate_notebook(script_content, checkpoint_dir, account.name)
-        nb_path = Path(f"{self.key}_{account.name}_training.ipynb")
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '-', account.name)
+        notebook = self._generate_notebook(script_content, checkpoint_dir, safe_name)
+        nb_path = Path(f"{self.key}_{safe_name}_training.ipynb")
         nb_path.write_text(json.dumps(notebook, indent=2))
 
         return {

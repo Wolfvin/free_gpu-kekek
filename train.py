@@ -29,7 +29,7 @@ def parse_args():
 
 
 def save_checkpoint(checkpoint_dir: str, epoch: int, loss: float, best_loss: float,
-                    model_state: dict = None, extra: dict = None):
+                    model_state: dict = None, extra: dict = None, total_epochs: int = 100):
     """Save a training checkpoint."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     state = {
@@ -57,7 +57,7 @@ def save_checkpoint(checkpoint_dir: str, epoch: int, loss: float, best_loss: flo
     state_path = os.path.join(checkpoint_dir, "training_state.json")
     with open(state_path, "w") as f:
         json.dump({
-            "total_epochs": 100,  # your total epochs
+            "total_epochs": total_epochs,
             "completed_epochs": epoch,
             "current_loss": loss,
             "best_loss": best_loss,
@@ -135,6 +135,7 @@ def train():
                 epoch=epoch,
                 loss=loss,
                 best_loss=best_loss,
+                total_epochs=args.epochs,
             )
 
         # Simulate training time
