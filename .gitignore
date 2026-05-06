@@ -1,4 +1,23 @@
-# Python
+# ── Secrets & Credentials — NEVER commit these ──────────────────
+.env
+.env.*
+!.env.example
+.master_key
+*.key
+*.pem
+*.p12
+*.pfx
+*.pub
+
+config.yaml
+config.local.yaml
+config.yaml.bak
+secrets.yaml
+credentials.json
+kaggle.json
+service-account*.json
+
+# ── Python ──────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -7,46 +26,40 @@ __pycache__/
 dist/
 build/
 *.egg
-
-# Virtual environments
 .venv/
 venv/
 env/
 
-# IDE
+# ── IDE ─────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# ── OS ──────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Secrets and credentials — NEVER commit these
-.env
-.env.*
-!.env.example
-.master_key
-*.key
-*.pem
-*.pub
-config.yaml
-config.yaml.bak
-config.local.yaml
+# ── Database ────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
 
-# Runtime state
+# ── Runtime State ───────────────────────────────────────────────
 checkpoints/
 state.json
 trainer.log
 run_session.sh
+training.pid
 
-# Generated notebooks
+# ── Generated Notebooks ─────────────────────────────────────────
 *.ipynb
 .ipynb_checkpoints/
 
-# Training artifacts
+# ── Training Artifacts ──────────────────────────────────────────
 outputs/
 logs/
 wandb/
+runs/
+artifacts/

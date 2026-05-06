@@ -1,4 +1,4 @@
-"""Credential encryption for free-gpu-trainer.
+"""Credential encryption and secret redaction for FamilyGPU Orchestrator.
 
 Uses OS keychain (keyring) when available, falls back to
 Fernet symmetric encryption with a master key stored in .master_key.
@@ -6,15 +6,17 @@ Fernet symmetric encryption with a master key stored in .master_key.
 Security model:
   - Preferred: OS keychain via `keyring` (credentials never touch disk as plaintext)
   - Fallback: Fernet encryption (cryptography library) with .master_key file
-  - If neither is available: raises RuntimeError (refuses to save)
+  - Plaintext is DISABLED — the system will refuse to save or load plaintext credentials
+  - All log output is passed through redaction to prevent credential leaks
 
-Usage in config.yaml:
-  credentials:
-    kaggle_username: "plain:myuser"
-    kaggle_key: "enc:gAAAAABl..."
+Usage:
+  vault.encrypt_credentials(platform_key, account_name, creds)
+  vault.decrypt_credentials(platform_key, account_name, stored_creds)
+  vault.redact_text(text_with_possible_secrets)
 """
 
 import os
+import re
 import json
 import logging
 import base64
@@ -26,10 +28,71 @@ logger = logging.getLogger("fgt.vault")
 # ── Encryption Constants ───────────────────────────────────────────
 
 KEY_FILE = ".master_key"
-KEYRING_SERVICE = "free-gpu-trainer"
+KEYRING_SERVICE = "familygpu-orchestrator"
 ENC_PREFIX = "enc:"
-PLAIN_PREFIX = "plain:"
 
+# ── Secret Redaction Patterns ──────────────────────────────────────
+# Patterns for detecting and redacting secrets in text output.
+# Used for logs, notebook content, and training scripts.
+
+SECRET_PATTERNS = [
+    # Google API keys
+    (re.compile(r"AIza[0-9A-Za-z\-_]{35}"), "AIza[REDACTED]"),
+    # HuggingFace tokens
+    (re.compile(r"hf_[0-9A-Za-z]{20,}"), "hf_[REDACTED]"),
+    # AWS Access Key IDs
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[REDACTED]"),
+    # AWS Secret Access Keys (base64-ish, 40 chars after key/secret)
+    (re.compile(r"(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)\s*[=:]\s*[A-Za-z0-9/+=]{40}"),
+     "AWS_SECRET=[REDACTED]"),
+    # Private keys (DOTALL flag to match across newlines)
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA )?PRIVATE KEY-----", re.DOTALL),
+     "-----BEGIN PRIVATE KEY [REDACTED]-----"),
+    # Generic password/secret assignments
+    (re.compile(r"(password|passwd|secret)\s*[=:]\s*['\"][^'\"]{8,}['\"]", re.IGNORECASE),
+     r"\1=[REDACTED]"),
+    # Generic token assignments
+    (re.compile(r"(token|bearer|auth_key|api_key)\s*[=:]\s*['\"][a-zA-Z0-9_\-]{20,}['\"]", re.IGNORECASE),
+     r"\1=[REDACTED]"),
+    # Kaggle keys (32-char hex)
+    (re.compile(r"[0-9a-f]{32}"), "[KAGGLE_KEY_REDACTED]"),
+    # Database URLs with credentials
+    (re.compile(r"(postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"), r"\1://[REDACTED]@"),
+    # SSH private key paths in config
+    (re.compile(r"(ssh_key|private_key_path)\s*[=:]\s*['\"]?[/~][^'\"]+['\"]?", re.IGNORECASE),
+     r"\1=[REDACTED]"),
+]
+
+
+def redact_text(text: str) -> str:
+    """Redact known secret patterns from text.
+
+    Apply this to any text before logging, embedding in notebooks,
+    or sending to external systems.
+    """
+    if not text:
+        return text
+    result = text
+    for pattern, replacement in SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def scan_for_secrets(content: str) -> list[str]:
+    """Scan content for potential secrets.
+
+    Returns a list of warning messages (empty = no secrets found).
+    """
+    warnings = []
+    for pattern, replacement in SECRET_PATTERNS:
+        if pattern.search(content):
+            # Extract a label from the replacement
+            label = replacement.replace("[REDACTED]", "").strip("=_ ")
+            warnings.append(f"Potential {label} detected" if label else "Potential secret detected")
+    return list(set(warnings))  # Deduplicate
+
+
+# ── Keyring Check ─────────────────────────────────────────────────
 
 def _has_keyring() -> bool:
     """Check if keyring library is available and functional.
@@ -40,7 +103,7 @@ def _has_keyring() -> bool:
     """
     try:
         import keyring
-        test_svc = "free-gpu-trainer-test"
+        test_svc = "familygpu-test"
         test_usr = "_probe_"
         keyring.set_password(test_svc, test_usr, "1")
         got = keyring.get_password(test_svc, test_usr)
@@ -68,7 +131,6 @@ def keyring_set(platform_key: str, account_name: str, creds: dict) -> bool:
     try:
         import keyring
         key = f"{platform_key}:{account_name}"
-        # Store all creds as a single JSON blob
         payload = json.dumps(creds)
         keyring.set_password(KEYRING_SERVICE, key, payload)
         return True
@@ -116,7 +178,6 @@ def _get_or_create_key(config_dir: str = ".") -> bytes:
         from cryptography.fernet import Fernet
         key = Fernet.generate_key()
         key_path.write_text(key.decode())
-        # Restrict permissions (owner only)
         os.chmod(key_path, 0o600)
         logger.info(f"Generated new master key: {key_path}")
         return base64.urlsafe_b64decode(key)
@@ -134,7 +195,7 @@ def fernet_decrypt(token: str, config_dir: str = ".") -> str:
     """Decrypt a Fernet-encrypted string."""
     from cryptography.fernet import Fernet, InvalidToken
     if not token.startswith(ENC_PREFIX):
-        return token  # Not encrypted
+        return token
     key = _get_or_create_key(config_dir)
     f = Fernet(base64.urlsafe_b64encode(key))
     try:
@@ -146,16 +207,17 @@ def fernet_decrypt(token: str, config_dir: str = ".") -> str:
 
 # ── Public API ─────────────────────────────────────────────────────
 
-def encrypt_credentials(platform_key: str, account_name: str, creds: dict, config_dir: str = ".") -> dict:
+def encrypt_credentials(platform_key: str, account_name: str, creds: dict,
+                        config_dir: str = ".") -> dict:
     """Encrypt credentials for storage.
 
     Strategy:
     1. Try OS keyring (best — creds never on disk)
-    2. Fallback: Fernet-encrypt values in config.yaml
+    2. Fallback: Fernet-encrypt values in config
     3. No encryption available: raises RuntimeError (refuses to save)
 
-    Returns dict suitable for config.yaml (encrypted values if using Fernet,
-    or empty dict if keyring handled it).
+    IMPORTANT: Plaintext storage is DISABLED.
+    The system will NEVER save credentials as plaintext.
     """
     if not creds:
         return {}
@@ -163,14 +225,13 @@ def encrypt_credentials(platform_key: str, account_name: str, creds: dict, confi
     # Try keyring first
     if keyring_set(platform_key, account_name, creds):
         logger.debug(f"Credentials stored in OS keychain for {platform_key}/{account_name}")
-        # Return special marker so we know to use keyring on load
         return {"_storage": "keyring"}
 
     # Try Fernet encryption
     if _has_cryptography():
         encrypted = {}
         for k, v in creds.items():
-            if v:  # Don't encrypt empty strings
+            if v:
                 encrypted[k] = fernet_encrypt(v, config_dir)
             else:
                 encrypted[k] = v
@@ -178,32 +239,36 @@ def encrypt_credentials(platform_key: str, account_name: str, creds: dict, confi
         logger.debug(f"Credentials Fernet-encrypted for {platform_key}/{account_name}")
         return encrypted
 
-    # No encryption available — REFUSE to save plaintext
+    # NO PLAINTEXT FALLBACK — raise error
     raise RuntimeError(
         f"Cannot save credentials for {platform_key}/{account_name}: "
         f"no encryption available. Install 'keyring' or 'cryptography' "
-        f"to enable secure credential storage."
+        f"to enable secure credential storage. "
+        f"Plaintext storage is DISABLED for security."
     )
 
 
-def decrypt_credentials(platform_key: str, account_name: str, stored: dict, config_dir: str = ".") -> dict:
-    """Decrypt credentials from config.yaml or keyring.
+def decrypt_credentials(platform_key: str, account_name: str, stored: dict,
+                        config_dir: str = ".") -> dict:
+    """Decrypt credentials from storage.
 
     Returns dict of {key: plaintext_value}.
+
+    IMPORTANT: If stored credentials are in plaintext format (no _storage marker,
+    no enc: prefix), they will be REJECTED with a warning.
+    This prevents accidental loading of plaintext credentials.
     """
     if not stored:
         return {}
 
-    storage = stored.get("_storage", "plain")
+    storage = stored.get("_storage", "")
 
     # Keyring
     if storage == "keyring":
         creds = keyring_get(platform_key, account_name)
         if creds:
             return creds
-        # Fallthrough — keyring may have been cleared
         logger.warning(f"Keyring empty for {platform_key}/{account_name}, trying stored values")
-        # Remove _storage and try to use whatever's left
         stored = {k: v for k, v in stored.items() if k != "_storage"}
         if not stored:
             return {}
@@ -222,8 +287,12 @@ def decrypt_credentials(platform_key: str, account_name: str, stored: dict, conf
                 decrypted[k] = v
         return decrypted
 
-    # Plaintext
-    return {k: v for k, v in stored.items() if k != "_storage"}
+    # Plaintext — REJECT
+    logger.error(
+        f"SECURITY: Plaintext credentials detected for {platform_key}/{account_name}. "
+        f"Plaintext storage is disabled. Please re-enter credentials to encrypt them."
+    )
+    return {}
 
 
 def delete_credentials(platform_key: str, account_name: str) -> None:
@@ -237,4 +306,22 @@ def get_storage_mode() -> str:
         return "OS Keychain (keyring)"
     if _has_cryptography():
         return "Fernet Encryption (.master_key)"
-    return "❌ NO ENCRYPTION (install keyring or cryptography to save credentials)"
+    return "NO ENCRYPTION AVAILABLE (install keyring or cryptography to save credentials)"
+
+
+def get_credential_status(credential_ref: str) -> str:
+    """Get display status for a credential reference.
+
+    Returns: 'configured', 'missing', or 'invalid'
+    """
+    if not credential_ref or credential_ref == "none":
+        return "missing"
+    if credential_ref.startswith("keyring:"):
+        # Verify keyring has the data
+        parts = credential_ref.split(":", 2)
+        if len(parts) >= 3:
+            creds = keyring_get(parts[1], parts[2])
+            return "configured" if creds else "invalid"
+    if credential_ref.startswith("fernet:"):
+        return "configured"
+    return "missing"

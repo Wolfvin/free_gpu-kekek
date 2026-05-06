@@ -1,20 +1,61 @@
-# GPU Account Scheduler
+# FamilyGPU Orchestrator
 
-A terminal-based tool and CLI for scheduling AI training jobs across GPU platform accounts you own. Designed for AI agents and power users who need to maximize their own GPU allocation across platforms like Kaggle, Oracle Cloud, and GCP.
+> **Quota-Aware Multi-Account GPU Scheduler**
 
-> **⚠️ Compliance Notice:** This tool is designed for scheduling workloads across accounts and platforms **you legitimately own or are authorized to use**. Rotating between multiple accounts on the same platform to circumvent usage limits may violate that platform's Terms of Service. Users are responsible for ensuring their usage complies with each platform's policies. The authors of this tool do not endorse or encourage any violation of platform terms.
+A TUI + local scheduler for managing authorized GPU/compute accounts
+across 12 free-tier providers. Designed for families who want to pool
+their legitimate account quotas for AI training workloads.
+
+> ⚠️ **This project is for authorized accounts only.**
+> It does NOT create accounts, bypass limits, use CAPTCHA solvers,
+> or perform any anti-detection/evasion. All accounts must be owned
+> or explicitly authorized by their owners.
+
+## Key Principles
+
+| ✅ This Project Does | ❌ This Project Does NOT |
+|---|---|
+| Pool authorized account quotas | Create accounts automatically |
+| Schedule jobs across providers | Bypass provider usage limits |
+| Checkpoint and resume training | Use CAPTCHA bypass or fingerprint spoofing |
+| Encrypt credentials securely | Share credentials with agents or scripts |
+| Track usage per owner/account | Claim "unlimited free GPU" |
+| Enforce daily/weekly limits | Perform ban evasion |
 
 ## Features
 
-- **12 GPU Platforms** supported: Google Colab, Kaggle, HuggingFace Spaces, Paperspace, SageMaker Studio Lab, Lightning AI, Codesphere, Oracle Cloud, GCP, Intel DevCloud, Deepnote, NVIDIA vGPU
-- **AUTO platforms** (Kaggle, Oracle Cloud SSH, GCP SSH) — fully automated push, start, status check, and stop
-- **MANUAL platforms** (Colab, notebooks) — generates notebooks for manual upload, requires `/confirm`
-- **Account stacking** — add multiple accounts per platform for longer continuous training
-- **Auto-rotation** — automatically rotates to the next account when session time is about to expire
-- **Checkpoint support** — saves and resumes training checkpoints across sessions
-- **Encrypted credentials** — OS keychain (keyring) preferred, Fernet encryption fallback, plaintext storage is **disabled**
-- **Headless CLI** — full JSON API for AI agent integration (`--status --json`, `--start`, `--stop`, `--confirm`, `--done`, `--schema`, `--platforms`)
-- **Event callbacks** — `on_session_confirmed`, `on_session_expired`, `on_rotation_needed`, `on_no_accounts` for programmatic control
+- **12 GPU Providers**: Google Colab, Kaggle, HuggingFace, Paperspace, SageMaker, Lightning AI, Codesphere, Oracle Cloud, GCP, Intel DevCloud, Deepnote, NVIDIA vGPU
+- **Account Pooling**: Add accounts from family members (papa, mama, adik) with per-owner quotas
+- **Smart Scheduler**: Selects best account based on quota, cooldown, priority, health, and provider capability
+- **AI Agent Interface**: Agents request GPU via API without seeing credentials
+- **SQLite State**: All state (accounts, jobs, leases, quota, audit) in a local SQLite database
+- **Credential Encryption**: OS keychain (preferred) or Fernet encryption — plaintext is DISABLED
+- **Checkpoint/Resume**: Training jobs checkpoint before lease expiry and resume on failover
+- **Audit Logging**: All important actions are recorded and viewable in TUI
+- **Quota Enforcement**: Daily and weekly limits per account, with cooldown tracking
+
+## Architecture
+
+```text
+TUI User ──→ Account Manager ──→ Secret Vault
+                  │
+                  ▼
+            SQLite State DB ←──→ Quota Ledger
+                  ▲
+            GPU Scheduler
+                  ▲
+            AI Agent Loop
+                  │
+                  ▼
+            Training Job Req
+
+Scheduler creates:
+  GPU Lease ──→ Provider Adapter Interface
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+       Colab    Kaggle     GCP ...
+```
 
 ## Quick Start
 
@@ -22,75 +63,140 @@ A terminal-based tool and CLI for scheduling AI training jobs across GPU platfor
 # Install dependencies
 pip install -r requirements.txt
 
-# Launch interactive TUI
+# Launch TUI
 python run.py
 
-# Or use headless CLI
-python tui.py --status              # Human-readable status
-python tui.py --status --json       # JSON for agents
-python tui.py --start               # Start training headlessly
-python tui.py --confirm             # Confirm session headlessly
-python tui.py --stop                # Stop training
-python tui.py --done                # Signal training complete
-python tui.py --schema kaggle       # Show credential schema
-python tui.py --platforms           # List all platforms
+# Or start HTTP API for agents
+python run.py --api --api-port 8420
+
+# Check status
+python run.py --status
+python run.py --status --json
 ```
 
-## TUI Commands
+## First-Time Setup
 
-| Command | Description |
-|---------|-------------|
-| `/add` | Add platform → enter credentials → stack accounts |
-| `/remove` | Remove a platform |
-| `/choose` | Force next session to a specific platform |
-| `/start` | Start training (AUTO platforms confirm automatically) |
-| `/confirm` | Confirm training is running (required for MANUAL platforms) |
-| `/stop` | Stop training |
-| `/done` | Signal training complete, rotate to next account early |
-| `/status` | Show current session + platform status |
-| `/save` | Save config to config.yaml |
-| `/reset` | Reset weekly counters |
-| `/help` | Show all commands |
+1. **Add Owners** — Go to Settings tab, add family members (me, papa, mama, adik)
+2. **Add Accounts** — Go to Accounts tab, add GPU accounts for each owner
+3. **Submit Jobs** — Go to Jobs tab, submit a training job
+4. **Monitor** — Check Leases and Usage tabs for real-time status
 
-## Platform Types
+## Agent API
 
-- **AUTO** (green) — Push + start + status all automated via API or SSH. No manual intervention needed.
-- **MANUAL** (yellow) — Generates notebook for manual upload. Requires `/confirm` after you start it in browser.
+AI agents can request GPU compute without accessing credentials:
 
-## Credential Security
+```python
+from api import GPUSchedulerAPI
+from scheduler.request import JobRequest
 
-Credentials are encrypted before storage:
-1. **OS Keychain** (preferred) — via `keyring` library. Credentials never touch disk as plaintext.
-2. **Fernet Encryption** — via `cryptography` library. Encrypted with `.master_key` file.
-3. **Plaintext** — **DISABLED**. The tool will refuse to save credentials if neither keyring nor cryptography is installed.
+api = GPUSchedulerAPI()
 
-## Important: HuggingFace Spaces
+request = JobRequest(
+    job_name="train-lora-001",
+    gpu_profile="medium_gpu",
+    max_runtime_minutes=180,
+    checkpoint_uri="file:///workspace/checkpoints/train-lora-001",
+    entrypoint="train.py",
+    priority="normal",
+)
 
-HuggingFace Spaces (ZeroGPU) is designed for **hosting ML demos and inference endpoints**, NOT for long-running training jobs. The ZeroGPU quota is per-request (seconds to minutes), not per-session. Use Kaggle or Oracle Cloud SSH for actual training workloads.
-
-## Legal Disclaimer
-
-This software is provided "as is" without warranty of any kind. Users must:
-- Only use accounts and platforms they are authorized to access
-- Comply with each platform's Terms of Service
-- Not use this tool to circumvent platform usage limits or restrictions
-- Be aware that some platforms prohibit automated access or account rotation
-
-The tool's "account stacking" feature is intended for users with **multiple legitimately-owned accounts** (e.g., different projects, team accounts) on the same platform. Using it to create fake accounts or circumvent free tier limits is not endorsed.
-
-## Architecture
-
+result = api.request_gpu(request)
+# result.status = "accepted"
+# result.provider = "kaggle"
+# result.account_owner = "mama"  # Agent sees owner, NOT credentials
 ```
-tui.py          — TUI app + headless CLI entry point
-handlers.py     — Platform integrations (API, SSH, notebook generators)
-session.py      — Session manager with rotation, events, state persistence
-platforms.py    — Platform definitions and credential schemas
-vault.py        — Credential encryption (keyring/Fernet)
-trainer.py      — Training job management with checkpoint support
-train.py        — Sample training script (replace with your own)
-run.py          — Quick launcher
+
+Or via HTTP:
+
+```bash
+# Submit job
+curl -X POST http://localhost:8420/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"job_name": "train-lora-001", "gpu_profile": "small_gpu", "max_runtime_minutes": 180, "checkpoint_uri": "file:///ckpt/job1"}'
+
+# Check status
+curl http://localhost:8420/jobs/job_abc123
+
+# Cancel
+curl -X POST http://localhost:8420/jobs/job_abc123/cancel
+```
+
+## Provider Classes
+
+| Class | Providers | Automation Level |
+|-------|-----------|-----------------|
+| **A — API/SSH** | Oracle Cloud, GCP, Paperspace, Lightning AI, Codesphere | Full auto (SSH) or API |
+| **B — Notebook** | Google Colab, Kaggle, SageMaker, Deepnote | Partial (Kaggle auto, others manual) |
+| **C — Special** | HuggingFace, Intel DevCloud, NVIDIA vGPU | Manual required in MVP |
+
+> **Note**: HuggingFace Spaces (ZeroGPU) is designed for inference/demos,
+> NOT for long-running training. Use Kaggle or Oracle Cloud SSH for actual training.
+
+## Security Model
+
+```text
+TUI input → Secret Vault encrypt → SQLite stores only credential_ref
+                                    ↓
+                            Scheduler requests at runtime
+                                    ↓
+                            Provider adapter receives in memory only
+                                    ↓
+                            Credential never logged, never in notebook
+```
+
+- ✅ OS keychain (keyring) preferred — credentials never on disk
+- ✅ Fernet encryption fallback — .master_key file with 600 permissions
+- ❌ Plaintext storage is DISABLED — system refuses to save plaintext
+- ✅ Secret scanning before embedding scripts in notebooks
+- ✅ Log redaction for API keys, tokens, passwords, private keys
+- ✅ .master_key and .env are in .gitignore and never committed
+
+## Training Script Contract
+
+Training scripts must implement:
+
+```python
+def save_checkpoint(path: str) -> None: ...
+def load_checkpoint(path: str) -> None: ...
+def train(resume_from: str | None = None) -> None: ...
+```
+
+See `train.py` for a complete example.
+
+## Database Schema
+
+The SQLite database contains these tables:
+- **owners** — Account owners (me, papa, mama, adik)
+- **providers** — 12 GPU provider definitions
+- **accounts** — User accounts linked to owners and providers
+- **jobs** — Training job requests and their status
+- **leases** — GPU lease lifecycle (pending → running → completed/failed/expired)
+- **quota_ledger** — Usage tracking per account/day/week
+- **provider_health** — Health check results
+- **audit_logs** — Append-only audit trail
+- **secrets_metadata** — Credential metadata (not the secrets themselves)
+
+## Running Tests
+
+```bash
+python -m pytest tests/ -v
+# Or individually:
+python tests/test_repositories.py
+python tests/test_vault.py
+python tests/test_scheduler.py
+python tests/test_providers.py
 ```
 
 ## License
 
-MIT
+MIT — Use responsibly. This tool is designed for managing YOUR OWN authorized accounts only.
+
+## Disclaimer
+
+This project helps manage authorized GPU accounts. It is NOT designed for:
+- Creating multiple accounts to circumvent provider limits
+- Bypassing CAPTCHAs or security measures
+- Evading bans or detection systems
+- Any activity that violates provider terms of service
+
+Users are solely responsible for ensuring their use complies with all applicable provider terms and conditions.
