@@ -32,12 +32,20 @@ PLAIN_PREFIX = "plain:"
 
 
 def _has_keyring() -> bool:
-    """Check if keyring library is available and functional."""
+    """Check if keyring library is available and functional.
+
+    Uses a round-trip set/get/delete test instead of checking
+    internal backend name strings, which are fragile and may
+    change across keyring versions.
+    """
     try:
         import keyring
-        # Test that keyring can actually work (not just a noop backend)
-        k = keyring.get_keyring()
-        return k.name != "fail"  # fail is the noop backend
+        test_svc = "free-gpu-trainer-test"
+        test_usr = "_probe_"
+        keyring.set_password(test_svc, test_usr, "1")
+        got = keyring.get_password(test_svc, test_usr)
+        keyring.delete_password(test_svc, test_usr)
+        return got == "1"
     except Exception:
         return False
 

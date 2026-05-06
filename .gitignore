@@ -11,4 +11,5 @@ trainer.log
 config.yaml
 config.yaml.bak
 *.key
+.master_key
 .env
