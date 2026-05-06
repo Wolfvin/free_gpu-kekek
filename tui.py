@@ -39,6 +39,7 @@ from vault import encrypt_credentials, delete_credentials, get_storage_mode
 from handlers import validate_account_name, is_auto_platform, is_manual_platform, platform_type_label, get_handler
 
 import time
+import threading
 import yaml
 import logging
 from pathlib import Path
@@ -792,6 +793,7 @@ class FreeGPUTrainerApp(App):
         self.session_manager: Optional[SessionManager] = None
         self._tick_timer: Optional[Timer] = None
         self._status_check_counter: int = 0
+        self._status_check_running: bool = False  # True while background status check is in progress
         self._current_job = None  # TrainingJob for save_state on rotate
         self._setup_logging()
         self._build_platforms()
@@ -875,17 +877,38 @@ class FreeGPUTrainerApp(App):
             if self.session_manager:
                 self.training_active = self.session_manager.is_training
 
+                # Auto-reset weekly counters if a new week has started
+                self.session_manager.auto_reset_weekly_if_needed()
+
                 # Periodic status check (every STATUS_CHECK_INTERVAL seconds)
+                # Run in background thread to avoid blocking the TUI event loop
                 self._status_check_counter += 1
                 if (self._status_check_counter >= self.STATUS_CHECK_INTERVAL and
                         self.session_manager.is_training and
-                        self.session_manager.current_session.is_confirmed):
+                        self.session_manager.current_session.is_confirmed and
+                        not getattr(self, '_status_check_running', False)):
                     self._status_check_counter = 0
-                    status = self.session_manager.check_current_session_status()
-                    if status:
-                        self._log(f"[dim]Platform status: {status}[/dim]")
+                    self._status_check_running = True
+                    threading.Thread(
+                        target=self._run_status_check, daemon=True
+                    ).start()
         except Exception:
             pass
+
+    def _run_status_check(self):
+        """Run status check in a background thread, then update UI via call_from_thread.
+
+        This prevents blocking the TUI event loop while waiting for
+        subprocess calls (SSH, Kaggle API) that can take 10-30 seconds.
+        """
+        try:
+            status = self.session_manager.check_current_session_status()
+            if status:
+                self.call_from_thread(self._log, f"[dim]Platform status: {status}[/dim]")
+        except Exception as e:
+            self.logger.debug(f"Background status check error: {e}")
+        finally:
+            self._status_check_running = False
 
     # ── Command Bar ─────────────────────────────────────────────
 
@@ -1228,7 +1251,8 @@ class FreeGPUTrainerApp(App):
             s = self.session_manager.current_session
             handler = _get_handler(s.platform.key)
             if handler:
-                result = handler.stop_session(s.account)
+                entry_script = self.session_manager.entry_script
+                result = handler.stop_session(s.account, entry_script)
                 if not result.get("ok"):
                     self._log(f"[dim]Handler stop: {result.get('message', '')}[/dim]")
             self.session_manager.stop()

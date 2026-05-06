@@ -200,11 +200,11 @@ class PlatformHandler(ABC):
         pass
 
     @abstractmethod
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         pass
 
     @abstractmethod
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         pass
 
     def is_available(self, account) -> dict:
@@ -269,7 +269,7 @@ class KaggleHandler(PlatformHandler):
         if not ckpt_path.exists() or not any(ckpt_path.iterdir()):
             return {"ok": True, "message": "No checkpoints to upload"}
 
-        username = os.environ.get("KAGGLE_USERNAME", "")
+        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME")
         if not username:
             return {"ok": False, "message": "KAGGLE_USERNAME not set for dataset upload"}
 
@@ -289,8 +289,8 @@ class KaggleHandler(PlatformHandler):
             result = subprocess.run(
                 ["kaggle", "datasets", "create", "-p", str(ckpt_path), "--dir-mode", "zip"],
                 capture_output=True, text=True, timeout=60,
-                env={**os.environ, "KAGGLE_USERNAME": os.environ.get("KAGGLE_USERNAME", ""),
-                     "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
+                env={**os.environ, "KAGGLE_USERNAME": _cred(account, "kaggle_username", "KAGGLE_USERNAME"),
+                     "KAGGLE_KEY": _cred(account, "kaggle_key", "KAGGLE_KEY")},
             )
             if result.returncode == 0:
                 return {"ok": True, "message": f"Checkpoints uploaded as dataset: {dataset_slug}"}
@@ -299,8 +299,8 @@ class KaggleHandler(PlatformHandler):
                 ["kaggle", "datasets", "version", "-p", str(ckpt_path), "-m", "Updated checkpoints",
                  "--dir-mode", "zip"],
                 capture_output=True, text=True, timeout=60,
-                env={**os.environ, "KAGGLE_USERNAME": os.environ.get("KAGGLE_USERNAME", ""),
-                     "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
+                env={**os.environ, "KAGGLE_USERNAME": _cred(account, "kaggle_username", "KAGGLE_USERNAME"),
+                     "KAGGLE_KEY": _cred(account, "kaggle_key", "KAGGLE_KEY")},
             )
             if result2.returncode == 0:
                 return {"ok": True, "message": f"Checkpoints dataset updated: {dataset_slug}"}
@@ -320,7 +320,7 @@ class KaggleHandler(PlatformHandler):
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
-        username = os.environ.get("KAGGLE_USERNAME", "")
+        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME")
         if not username:
             return {"ok": False, "message": "KAGGLE_USERNAME not set — cannot determine kernel owner"}
 
@@ -330,7 +330,7 @@ class KaggleHandler(PlatformHandler):
         # Include checkpoint dataset as a data source if it exists
         dataset_sources = []
         ckpt_path = Path(checkpoint_dir)
-        if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+        if ckpt_path.exists() and any(ckpt_path.iterdir()):
             dataset_sources.append(f"{username}/{safe_name}-checkpoints")
 
         kernel_meta = {
@@ -355,8 +355,8 @@ class KaggleHandler(PlatformHandler):
             result = subprocess.run(
                 ["kaggle", "kernels", "push", "-p", str(script.parent)],
                 capture_output=True, text=True, timeout=60,
-                env={**os.environ, "KAGGLE_USERNAME": os.environ.get("KAGGLE_USERNAME", ""),
-                     "KAGGLE_KEY": os.environ.get("KAGGLE_KEY", "")},
+                env={**os.environ, "KAGGLE_USERNAME": _cred(account, "kaggle_username", "KAGGLE_USERNAME"),
+                     "KAGGLE_KEY": _cred(account, "kaggle_key", "KAGGLE_KEY")},
             )
             if result.returncode == 0:
                 # Upload checkpoints as dataset for resume support
@@ -382,12 +382,12 @@ class KaggleHandler(PlatformHandler):
         return self.push_code(account, entry_script)
 
     @with_retry(max_retries=2, base_delay=2.0)
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed", "status": "unknown"}
 
-        username = os.environ.get("KAGGLE_USERNAME", "")
+        username = _cred(account, "kaggle_username", "KAGGLE_USERNAME")
         if not username:
             return {"ok": False, "message": "KAGGLE_USERNAME not set", "status": "unknown"}
 
@@ -415,7 +415,7 @@ class KaggleHandler(PlatformHandler):
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
 
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         return {"ok": True, "message": "Kaggle kernels auto-stop after session limit"}
 
     def is_available(self, account) -> dict:
@@ -535,7 +535,7 @@ if __name__ == "__main__":
         return self.push_code(account, entry_script)
 
     @with_retry(max_retries=2, base_delay=2.0)
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed", "status": "unknown"}
@@ -550,7 +550,7 @@ if __name__ == "__main__":
             return {"ok": False, "message": str(e), "status": "error"}
 
     @with_retry(max_retries=2, base_delay=1.0)
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         api = self._get_client(account)
         if not api:
             return {"ok": False, "message": "Auth failed"}
@@ -680,10 +680,10 @@ class GoogleColabHandler(PlatformHandler):
     def start_session(self, account, entry_script: str = "train.py") -> dict:
         return self.push_code(account, entry_script)
 
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         return {"ok": True, "status": "unknown", "message": "Colab has no status API — check browser"}
 
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         return {"ok": True, "message": "Stop Colab manually in browser (Runtime > Disconnect)"}
 
     def is_available(self, account) -> dict:
@@ -738,9 +738,10 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": f"Script not found: {script_path}"}
 
         try:
-            # Push script
+            # Push script — preserve original filename on remote so start_session can find it
+            remote_script_name = script.name  # e.g. "finetune.py", not always "train.py"
             result = subprocess.run(
-                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
+                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/{remote_script_name}"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
@@ -748,7 +749,7 @@ class OracleCloudHandler(PlatformHandler):
 
             # Push checkpoints if they exist (for resume support)
             ckpt_path = Path(checkpoint_dir)
-            if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+            if ckpt_path.exists() and any(ckpt_path.iterdir()):
                 ckpt_result = subprocess.run(
                     ["scp", "-i", expanded_key, "-r", str(ckpt_path), f"{safe_user}@{safe_host}:~/checkpoints"],
                     capture_output=True, text=True, timeout=30,
@@ -772,10 +773,12 @@ class OracleCloudHandler(PlatformHandler):
             return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
 
         safe_host, safe_user, expanded_key = safe
+        # Use the basename of entry_script so it matches the SCP'd file
+        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"nohup python ~/{entry_script} > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{script_name} > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -784,30 +787,32 @@ class OracleCloudHandler(PlatformHandler):
         except Exception as e:
             return {"ok": False, "message": f"Start error: {e}"}
 
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         safe = self._validated_ssh(account)
         if not safe:
             return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
         safe_host, safe_user, expanded_key = safe
+        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 "ps aux | grep train.py | grep -v grep || echo 'not running'"],
+                 f"ps aux | grep {script_name} | grep -v grep || echo 'not running'"],
                 capture_output=True, text=True, timeout=10,
             )
-            running = "train.py" in result.stdout and "not running" not in result.stdout
+            running = script_name in result.stdout and "not running" not in result.stdout
             return {"ok": True, "status": "running" if running else "stopped", "message": result.stdout.strip()}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
 
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         safe = self._validated_ssh(account)
         if not safe:
             return {"ok": True, "message": "No valid SSH config — stop manually"}
         safe_host, safe_user, expanded_key = safe
+        script_name = Path(entry_script).name
         try:
             subprocess.run(
-                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", "pkill -f train.py"],
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", f"pkill -f {script_name}"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}
@@ -860,9 +865,10 @@ class GCPHandler(PlatformHandler):
         if not script.exists():
             return {"ok": False, "message": f"Script not found: {script_path}"}
         try:
-            # Push script
+            # Push script — preserve original filename on remote so start_session can find it
+            remote_script_name = script.name  # e.g. "finetune.py", not always "train.py"
             result = subprocess.run(
-                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/train.py"],
+                ["scp", "-i", expanded_key, str(script), f"{safe_user}@{safe_host}:~/{remote_script_name}"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
@@ -870,7 +876,7 @@ class GCPHandler(PlatformHandler):
 
             # Push checkpoints for resume support
             ckpt_path = Path(checkpoint_dir)
-            if ckpt_path.exists() and any(ckpt_path.glob("*.json")):
+            if ckpt_path.exists() and any(ckpt_path.iterdir()):
                 ckpt_result = subprocess.run(
                     ["scp", "-i", expanded_key, "-r", str(ckpt_path), f"{safe_user}@{safe_host}:~/checkpoints"],
                     capture_output=True, text=True, timeout=30,
@@ -894,10 +900,12 @@ class GCPHandler(PlatformHandler):
             return {"ok": False, "message": f"Invalid SSH host or username. Host: {host!r}, User: {user!r}"}
 
         safe_host, safe_user, expanded_key = safe
+        # Use the basename of entry_script so it matches the SCP'd file
+        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 f"nohup python ~/{entry_script} > ~/training.log 2>&1 &"],
+                 f"nohup python ~/{script_name} > ~/training.log 2>&1 &"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
@@ -906,30 +914,32 @@ class GCPHandler(PlatformHandler):
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         safe = self._validated_ssh(account)
         if not safe:
             return {"ok": True, "status": "unknown", "message": "No valid SSH config"}
         safe_host, safe_user, expanded_key = safe
+        script_name = Path(entry_script).name
         try:
             result = subprocess.run(
                 ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}",
-                 "ps aux | grep train.py | grep -v grep || echo 'not running'"],
+                 f"ps aux | grep {script_name} | grep -v grep || echo 'not running'"],
                 capture_output=True, text=True, timeout=10,
             )
-            running = "train.py" in result.stdout and "not running" not in result.stdout
+            running = script_name in result.stdout and "not running" not in result.stdout
             return {"ok": True, "status": "running" if running else "stopped", "message": result.stdout.strip()}
         except Exception as e:
             return {"ok": False, "message": str(e), "status": "error"}
 
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         safe = self._validated_ssh(account)
         if not safe:
             return {"ok": True, "message": "No valid SSH config — stop manually"}
         safe_host, safe_user, expanded_key = safe
+        script_name = Path(entry_script).name
         try:
             subprocess.run(
-                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", "pkill -f train.py"],
+                ["ssh", "-i", expanded_key, f"{safe_user}@{safe_host}", f"pkill -f {script_name}"],
                 capture_output=True, text=True, timeout=10,
             )
             return {"ok": True, "message": "Training process killed"}
@@ -1022,10 +1032,10 @@ class NotebookHandler(PlatformHandler):
     def start_session(self, account, entry_script: str = "train.py") -> dict:
         return self.push_code(account, entry_script)
 
-    def check_status(self, account) -> dict:
+    def check_status(self, account, entry_script: str = "train.py") -> dict:
         return {"ok": True, "status": "unknown", "message": f"{self.name} has no status API — check browser"}
 
-    def stop_session(self, account) -> dict:
+    def stop_session(self, account, entry_script: str = "train.py") -> dict:
         return {"ok": True, "message": f"Stop {self.name} manually in browser"}
 
 
