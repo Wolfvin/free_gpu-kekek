@@ -312,9 +312,9 @@ PLATFORM_DEFS: dict[str, dict] = {
         "name": "Oracle Cloud Free Tier",
         "url": "https://cloud.oracle.com/free",
         "gpu_type": "Ampere A1",
-        "session_limit_hours": 999,
+        "session_limit_hours": 24,
         "cooldown_minutes": 0,
-        "best_for": "Running LLMs, long-running tasks",
+        "best_for": "Running LLMs, long-running tasks (always-free VM, rotation optional)",
     },
     "gcp": {
         "name": "Google Cloud Platform",

@@ -362,7 +362,7 @@ class SessionManager:
             return None
 
         try:
-            result = handler.check_status(self.current_session.account)
+            result = handler.check_status(self.current_session.account, self.entry_script)
             if result.get("ok"):
                 status = result.get("status", "unknown")
                 self.current_session.update_platform_status(status)
@@ -419,3 +419,27 @@ class SessionManager:
                 if account.status == PlatformStatus.WEEKLY_LIMIT:
                     account.status = PlatformStatus.AVAILABLE
                 account.weekly_hours_used = 0.0
+
+    def auto_reset_weekly_if_needed(self):
+        """Check if a new week has started and auto-reset weekly counters.
+
+        Uses ISO week number: if the current week differs from the last
+        recorded week, all weekly counters are reset and WEEKLY_LIMIT
+        accounts are moved back to AVAILABLE.
+
+        This is called from the TUI tick on every iteration so it's
+        essentially free — no I/O, just a date comparison.
+        """
+        import datetime
+        current_week = datetime.date.today().isocalendar()[1]
+        current_year = datetime.date.today().isocalendar()[0]
+        week_key = f"{current_year}-W{current_week:02d}"
+
+        if not hasattr(self, '_last_reset_week'):
+            self._last_reset_week = week_key
+            return
+
+        if week_key != self._last_reset_week:
+            logger.info(f"New week detected ({week_key}), auto-resetting weekly counters")
+            self.reset_weekly()
+            self._last_reset_week = week_key
