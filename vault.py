@@ -1,11 +1,11 @@
 """Credential encryption and secret redaction for FamilyGPU Orchestrator.
 
 Uses OS keychain (keyring) when available, falls back to
-Fernet symmetric encryption with a master key stored in .master_key.
+Fernet symmetric encryption with a master key stored in ~/.familygpu/.master_key.
 
 Security model:
   - Preferred: OS keychain via `keyring` (credentials never touch disk as plaintext)
-  - Fallback: Fernet encryption (cryptography library) with .master_key file
+  - Fallback: Fernet encryption (cryptography library) with ~/.familygpu/.master_key
   - Plaintext is DISABLED — the system will refuse to save or load plaintext credentials
   - All log output is passed through redaction to prevent credential leaks
 
@@ -18,6 +18,7 @@ Usage:
 import os
 import re
 import json
+import shutil
 import logging
 import base64
 from pathlib import Path
@@ -27,6 +28,7 @@ logger = logging.getLogger("fgt.vault")
 
 # ── Encryption Constants ───────────────────────────────────────────
 
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".familygpu")
 KEY_FILE = ".master_key"
 KEYRING_SERVICE = "familygpu-orchestrator"
 ENC_PREFIX = "enc:"
@@ -169,21 +171,48 @@ def keyring_delete(platform_key: str, account_name: str) -> bool:
 
 # ── Fernet Encryption ──────────────────────────────────────────────
 
-def _get_or_create_key(config_dir: str = ".") -> bytes:
+def _get_key_path() -> Path:
+    """Get the master key path in ~/.familygpu/.
+
+    Creates the config directory with restricted permissions if needed.
+    Migrates an existing .master_key from the project root.
+    """
+    config_dir = Path(os.path.expanduser("~")) / ".familygpu"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(config_dir), 0o700)
+
+    key_path = config_dir / KEY_FILE
+
+    # Migration: move .master_key from project root to ~/.familygpu/
+    old_key = Path(__file__).parent / ".master_key"
+    if old_key.exists() and not key_path.exists():
+        shutil.copy2(str(old_key), str(key_path))
+        os.chmod(str(key_path), 0o600)
+        logger.info(f"Migrated master key: {old_key} -> {key_path}")
+
+    return key_path
+
+
+def _get_or_create_key(config_dir: str = None) -> bytes:
     """Get or create the master encryption key."""
-    key_path = Path(config_dir) / KEY_FILE
+    # config_dir is kept for API compatibility but now defaults to ~/.familygpu/
+    if config_dir is None or config_dir == ".":
+        key_path = _get_key_path()
+    else:
+        key_path = Path(config_dir) / KEY_FILE
     if key_path.exists():
         return base64.urlsafe_b64decode(key_path.read_text().strip())
     else:
         from cryptography.fernet import Fernet
         key = Fernet.generate_key()
+        key_path.parent.mkdir(parents=True, exist_ok=True)
         key_path.write_text(key.decode())
-        os.chmod(key_path, 0o600)
+        os.chmod(str(key_path), 0o600)
         logger.info(f"Generated new master key: {key_path}")
         return base64.urlsafe_b64decode(key)
 
 
-def fernet_encrypt(plaintext: str, config_dir: str = ".") -> str:
+def fernet_encrypt(plaintext: str, config_dir: str = None) -> str:
     """Encrypt a string using Fernet."""
     from cryptography.fernet import Fernet
     key = _get_or_create_key(config_dir)
@@ -191,7 +220,7 @@ def fernet_encrypt(plaintext: str, config_dir: str = ".") -> str:
     return ENC_PREFIX + f.encrypt(plaintext.encode()).decode()
 
 
-def fernet_decrypt(token: str, config_dir: str = ".") -> str:
+def fernet_decrypt(token: str, config_dir: str = None) -> str:
     """Decrypt a Fernet-encrypted string."""
     from cryptography.fernet import Fernet, InvalidToken
     if not token.startswith(ENC_PREFIX):
@@ -208,7 +237,7 @@ def fernet_decrypt(token: str, config_dir: str = ".") -> str:
 # ── Public API ─────────────────────────────────────────────────────
 
 def encrypt_credentials(platform_key: str, account_name: str, creds: dict,
-                        config_dir: str = ".") -> dict:
+                        config_dir: str = None) -> dict:
     """Encrypt credentials for storage.
 
     Strategy:
@@ -249,7 +278,7 @@ def encrypt_credentials(platform_key: str, account_name: str, creds: dict,
 
 
 def decrypt_credentials(platform_key: str, account_name: str, stored: dict,
-                        config_dir: str = ".") -> dict:
+                        config_dir: str = None) -> dict:
     """Decrypt credentials from storage.
 
     Returns dict of {key: plaintext_value}.
@@ -305,7 +334,7 @@ def get_storage_mode() -> str:
     if _has_keyring():
         return "OS Keychain (keyring)"
     if _has_cryptography():
-        return "Fernet Encryption (.master_key)"
+        return "Fernet Encryption (~/.familygpu/.master_key)"
     return "NO ENCRYPTION AVAILABLE (install keyring or cryptography to save credentials)"
 
 

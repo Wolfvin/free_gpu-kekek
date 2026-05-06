@@ -42,6 +42,7 @@ class PaperspaceAdapter(ProviderAdapter):
     provider_key: str = "paperspace"
     display_name: str = "Paperspace Gradient"
     provider_class: str = "A"
+    automation_level: str = "partial_auto"
     supports_auto: bool = True
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu", "medium_gpu",

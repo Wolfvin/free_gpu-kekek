@@ -40,6 +40,11 @@ def list_auto_adapters() -> list[ProviderAdapter]:
     return [a for a in _registry.values() if a.supports_auto]
 
 
+def list_by_automation_level(level: str) -> list[ProviderAdapter]:
+    """Get adapters filtered by automation level."""
+    return [a for a in _registry.values() if a.automation_level == level]
+
+
 # ── Auto-register all adapters on import ──────────────────────────
 
 def _auto_register():

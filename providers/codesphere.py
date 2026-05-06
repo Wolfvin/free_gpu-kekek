@@ -43,6 +43,7 @@ class CodesphereAdapter(ProviderAdapter):
     provider_key: str = "codesphere"
     display_name: str = "Codesphere"
     provider_class: str = "A"
+    automation_level: str = "partial_auto"
     supports_auto: bool = True
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu",

@@ -55,6 +55,7 @@ class IntelDevcloudAdapter(ProviderAdapter):
     provider_key: str = "intel_devcloud"
     display_name: str = "Intel Developer Cloud"
     provider_class: str = "C"
+    automation_level: str = "manual"
     supports_auto: bool = False
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu",

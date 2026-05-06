@@ -5,6 +5,16 @@ check job status, and cancel jobs. When auto loop is enabled,
 also provides endpoints for monitoring and controlling the
 auto-scheduling daemon.
 
+All endpoints (except /health) require Bearer token authentication.
+The token is auto-generated on first startup and saved to
+~/.familygpu/api_token. Use --no-auth flag to disable auth for
+development.
+
+Rate limiting: 60 requests per minute per IP.
+
+Health endpoint (no auth required):
+  GET  /health            — Health check
+
 Agent endpoints:
   POST /jobs              — Submit a training job
   GET  /jobs/{id}         — Check job status
@@ -25,7 +35,10 @@ Administrative endpoints:
 
 import json
 import logging
+import os
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -41,16 +54,83 @@ _api: Optional[GPUSchedulerAPI] = None
 # Global AutoLoop instance
 _autoloop: Optional[AutoLoop] = None
 
+# Authentication
+_api_token: Optional[str] = None
+_no_auth: bool = False
+
+
+def _load_or_create_token() -> str:
+    """Load or create API authentication token."""
+    import secrets
+    token_path = Path(os.path.expanduser("~")) / ".familygpu" / "api_token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if token_path.exists():
+        return token_path.read_text().strip()
+
+    token = secrets.token_urlsafe(32)
+    token_path.write_text(token)
+    os.chmod(str(token_path), 0o600)
+    logger.info(f"Generated new API token: {token[:8]}...")
+    logger.info(f"Full token saved to {token_path}")
+    return token
+
 
 class AgentAPIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the Agent API."""
+
+    # Rate limiter (class-level)
+    _rate_limits: dict[str, list[float]] = {}  # IP -> list of request timestamps
+    RATE_LIMIT_PER_MINUTE = 60
+
+    def _check_rate_limit(self) -> bool:
+        """Check if the request is within rate limits. Returns True if allowed."""
+        client_ip = self.client_address[0]
+        now = time.time()
+
+        if client_ip not in AgentAPIHandler._rate_limits:
+            AgentAPIHandler._rate_limits[client_ip] = []
+
+        # Remove timestamps older than 60 seconds
+        AgentAPIHandler._rate_limits[client_ip] = [
+            t for t in AgentAPIHandler._rate_limits[client_ip] if now - t < 60
+        ]
+
+        if len(AgentAPIHandler._rate_limits[client_ip]) >= AgentAPIHandler.RATE_LIMIT_PER_MINUTE:
+            return False
+
+        AgentAPIHandler._rate_limits[client_ip].append(now)
+        return True
+
+    def _check_auth(self) -> bool:
+        """Check bearer token authentication. Returns True if authorized."""
+        global _api_token, _no_auth
+        if _no_auth:
+            return True
+        if not _api_token:
+            return True  # No token configured = no auth required
+
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            return token == _api_token
+        return False
+
+    def _rate_limit_remaining(self) -> int:
+        """Return number of remaining requests for the client IP this minute."""
+        client_ip = self.client_address[0]
+        now = time.time()
+        timestamps = AgentAPIHandler._rate_limits.get(client_ip, [])
+        current = [t for t in timestamps if now - t < 60]
+        return max(0, AgentAPIHandler.RATE_LIMIT_PER_MINUTE - len(current))
 
     def _set_headers(self, status_code: int = 200, content_type: str = "application/json"):
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("X-RateLimit-Remaining", str(self._rate_limit_remaining()))
         self.end_headers()
 
     def _read_body(self) -> dict:
@@ -80,9 +160,24 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests."""
+        # Rate limit check
+        if not self._check_rate_limit():
+            self._send_error("Rate limit exceeded", 429)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         query = parse_qs(parsed.query)
+
+        # Health endpoint — no auth required
+        if path == "/health":
+            self._send_json({"status": "ok", "version": "0.1.0"})
+            return
+
+        # Auth check (all other endpoints)
+        if not self._check_auth():
+            self._send_error("Unauthorized — provide Bearer token", 401)
+            return
 
         if path == "/jobs":
             status = query.get("status", [None])[0]
@@ -135,6 +230,16 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests."""
+        # Rate limit check
+        if not self._check_rate_limit():
+            self._send_error("Rate limit exceeded", 429)
+            return
+
+        # Auth check (all POST endpoints require auth)
+        if not self._check_auth():
+            self._send_error("Unauthorized — provide Bearer token", 401)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -278,7 +383,8 @@ class AgentAPIHandler(BaseHTTPRequestHandler):
 
 def start_api_server(host: str = "127.0.0.1", port: int = 8420,
                      db_path: Optional[str] = None,
-                     autoloop: Optional[AutoLoop] = None):
+                     autoloop: Optional[AutoLoop] = None,
+                     no_auth: bool = False):
     """Start the HTTP API server.
 
     Args:
@@ -286,13 +392,22 @@ def start_api_server(host: str = "127.0.0.1", port: int = 8420,
         port: Port number (default: 8420)
         db_path: Path to SQLite database
         autoloop: Optional AutoLoop instance for auto-scheduling
+        no_auth: Disable Bearer token authentication (for development)
     """
-    global _api, _autoloop
+    global _api, _autoloop, _api_token, _no_auth
     _api = GPUSchedulerAPI(db_path=db_path)
     _autoloop = autoloop
+    _no_auth = no_auth
+
+    # Load or create API token
+    if not no_auth:
+        _api_token = _load_or_create_token()
+    else:
+        logger.warning("API authentication is DISABLED (--no-auth flag)")
 
     server = HTTPServer((host, port), AgentAPIHandler)
     logger.info(f"Agent API server starting on http://{host}:{port}")
+    logger.info("Health endpoint: GET /health (no auth required)")
     logger.info("Agent endpoints: POST /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel")
 
     if _autoloop and _autoloop.is_running:

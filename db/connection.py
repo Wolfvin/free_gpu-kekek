@@ -2,9 +2,11 @@
 
 Uses a single persistent connection with WAL mode for concurrency safety.
 The database file is created automatically on first use.
+State files are stored in ~/.familygpu/ for security (not in the project root).
 """
 
 import os
+import shutil
 import sqlite3
 import logging
 from pathlib import Path
@@ -12,15 +14,36 @@ from typing import Optional
 
 logger = logging.getLogger("fgt.db")
 
-# Default database path — can be overridden via DATABASE_URL env var
+# Default database path — stored in ~/.familygpu/ for security
+_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".familygpu")
 DEFAULT_DB_PATH = os.environ.get(
     "DATABASE_URL",
-    str(Path(__file__).parent.parent / "familygpu.db")
+    os.path.join(_CONFIG_DIR, "familygpu.db")
 )
 
 # If DATABASE_URL starts with "file:", strip the prefix
 if DEFAULT_DB_PATH.startswith("file:"):
     DEFAULT_DB_PATH = DEFAULT_DB_PATH[5:]
+
+
+def _ensure_config_dir() -> None:
+    """Create ~/.familygpu/ with restricted permissions if it doesn't exist.
+
+    Also migrates an existing familygpu.db from the project root to the new
+    location, so users don't lose their data on upgrade.
+    """
+    config_dir = Path(_CONFIG_DIR)
+    if not config_dir.exists():
+        config_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(config_dir), 0o700)
+        logger.info(f"Created config directory: {config_dir}")
+
+    # Migration: move database from project root to ~/.familygpu/
+    old_db = Path(__file__).parent.parent / "familygpu.db"
+    new_db = config_dir / "familygpu.db"
+    if old_db.exists() and not new_db.exists():
+        shutil.move(str(old_db), str(new_db))
+        logger.info(f"Migrated database: {old_db} -> {new_db}")
 
 DB_PATH = DEFAULT_DB_PATH
 
@@ -34,6 +57,8 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     Uses WAL mode for better concurrency and sets foreign keys ON.
     Connection is reused across calls (singleton pattern).
     """
+    # Ensure config dir exists before opening database
+    _ensure_config_dir()
     global _connection
     if _connection is not None:
         try:

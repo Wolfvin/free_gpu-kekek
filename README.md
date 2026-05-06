@@ -221,11 +221,11 @@ TUI input → Secret Vault encrypt → SQLite stores only credential_ref
 ```
 
 - ✅ OS keychain (keyring) preferred — credentials never on disk
-- ✅ Fernet encryption fallback — .master_key file with 600 permissions
+- ✅ Fernet encryption fallback — ~/.familygpu/.master_key file with 600 permissions
 - ❌ Plaintext storage is DISABLED — system refuses to save plaintext
 - ✅ Secret scanning before embedding scripts in notebooks
 - ✅ Log redaction for API keys, tokens, passwords, private keys
-- ✅ .master_key and .env are in .gitignore and never committed
+- ✅ State files stored in ~/.familygpu/ with 700 dir permissions (not in project root)
 
 ## Training Script Contract
 

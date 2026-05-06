@@ -39,11 +39,13 @@ def main():
     parser.add_argument("--api", action="store_true", help="Start HTTP API server")
     parser.add_argument("--api-host", default="127.0.0.1", help="API bind address")
     parser.add_argument("--api-port", type=int, default=8420, help="API port")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="Disable API Bearer token authentication (for development)")
     parser.add_argument("--auto", action="store_true",
                         help="Enable auto-scheduling daemon (continuous lease monitoring, auto-failover, auto-start queued jobs)")
     parser.add_argument("--status", action="store_true", help="Show system status")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--db", default=None, help="Path to SQLite database")
+    parser.add_argument("--db", default=None, help="Path to SQLite database (default: ~/.familygpu/familygpu.db)")
     parser.add_argument("--log-level", default="INFO", help="Log level (DEBUG, INFO, WARNING)")
 
     # Auto-loop configuration
@@ -61,9 +63,35 @@ def main():
                         help="Disable auto-starting queued jobs")
     parser.add_argument("--no-health-check", action="store_true",
                         help="Disable automatic health checks")
+    parser.add_argument("--no-rotation", action="store_true",
+                        help="Disable smart account rotation")
+    parser.add_argument("--no-auto-retry", action="store_true",
+                        help="Disable auto-retry for failed jobs")
+    parser.add_argument("--rotation-threshold", type=float, default=80.0,
+                        help="Quota usage percentage to trigger rotation (default: 80)")
+    parser.add_argument("--max-job-retries", type=int, default=3,
+                        help="Maximum auto-retry attempts for failed jobs (default: 3)")
+
+    # Backup/restore
+    parser.add_argument("--export", metavar="PATH",
+                        help="Export owners and accounts to encrypted backup file")
+    parser.add_argument("--import", metavar="PATH", dest="import_backup",
+                        help="Import owners and accounts from encrypted backup file")
+    parser.add_argument("--passphrase", default=None,
+                        help="Passphrase for backup encryption/decryption")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Validate import without making changes")
 
     args = parser.parse_args()
     setup_logging(args.log_level)
+
+    if args.export:
+        _export_data(args)
+        return
+
+    if args.import_backup:
+        _import_data(args)
+        return
 
     if args.status:
         _show_status(args.json, args.db, args.auto)
@@ -89,6 +117,11 @@ def _create_autoloop(args) -> "AutoLoop":
         auto_failover=not args.no_failover,
         auto_start_queued=not args.no_auto_start,
         auto_health_check=not args.no_health_check,
+        auto_rotation=not args.no_rotation,
+        auto_retry_failed=not args.no_auto_retry,
+        rotation_threshold_percent=args.rotation_threshold,
+        max_job_retries=args.max_job_retries,
+        auto_rebalance=True,
     )
 
     return AutoLoop(config=config)
@@ -132,12 +165,77 @@ def _start_api(args):
             port=args.api_port,
             db_path=args.db,
             autoloop=autoloop,
+            no_auth=args.no_auth,
         )
     except KeyboardInterrupt:
         pass
     finally:
         if autoloop and autoloop.is_running:
             autoloop.stop()
+
+
+def _export_data(args):
+    from db.connection import init_db
+    from db.backup import export_data
+
+    init_db(args.db)
+
+    try:
+        summary = export_data(args.export, passphrase=args.passphrase)
+        print("╔══════════════════════════════════════════════╗")
+        print("║     FamilyGPU — Backup Export Complete       ║")
+        print("╚══════════════════════════════════════════════╝")
+        print()
+        print(f"  File: {args.export}")
+        print(f"  Owners: {summary.get('owners', 0)}")
+        print(f"  Accounts: {summary.get('accounts', 0)}")
+        print(f"  Providers: {summary.get('providers', 0)}")
+        print(f"  Quota entries: {summary.get('quota_entries', 0)}")
+        print(f"  Audit entries: {summary.get('audit_entries', 0)}")
+        print()
+        print("  ⚠ Credentials are NOT included in backup.")
+        print("  You must re-enter credentials after import.")
+    except Exception as e:
+        print(f"Export failed: {e}")
+        sys.exit(1)
+
+
+def _import_data(args):
+    from db.connection import init_db
+    from db.backup import import_data
+
+    init_db(args.db)
+
+    try:
+        summary = import_data(
+            args.import_backup,
+            passphrase=args.passphrase,
+            dry_run=args.dry_run,
+        )
+
+        if summary.get("dry_run"):
+            print("╔══════════════════════════════════════════════╗")
+            print("║     FamilyGPU — Backup Validation (DRY RUN) ║")
+            print("╚══════════════════════════════════════════════╝")
+            print()
+            print(f"  Would import owners: {summary.get('would_import_owners', 0)}")
+            print(f"  Would import accounts: {summary.get('would_import_accounts', 0)}")
+            print(f"  Note: {summary.get('note', '')}")
+        else:
+            print("╔══════════════════════════════════════════════╗")
+            print("║     FamilyGPU — Backup Import Complete       ║")
+            print("╚══════════════════════════════════════════════╝")
+            print()
+            print(f"  Imported owners: {summary.get('imported_owners', 0)}")
+            print(f"  Imported accounts: {summary.get('imported_accounts', 0)}")
+            print(f"  Skipped owners: {summary.get('skipped_owners', 0)}")
+            print(f"  Skipped accounts: {summary.get('skipped_accounts', 0)}")
+            print()
+            print("  ⚠ You must re-enter credentials for imported accounts.")
+            print("  Use the TUI /add command to add credentials.")
+    except Exception as e:
+        print(f"Import failed: {e}")
+        sys.exit(1)
 
 
 def _show_status(as_json: bool = False, db_path: str = None, show_auto: bool = False):
@@ -195,6 +293,9 @@ def _show_status(as_json: bool = False, db_path: str = None, show_auto: bool = F
         print("    ✓ Preemptive checkpoint before lease expiry")
         print("    ✓ Periodic health checks on accounts")
         print("    ✓ Auto-disable accounts with repeated errors")
+        print("    ✓ Smart account rotation before quota exhaustion")
+        print("    ✓ Auto-retry failed jobs with exponential backoff")
+        print("    ✓ Auto-rebalance jobs across accounts")
 
 
 if __name__ == "__main__":

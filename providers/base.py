@@ -54,6 +54,9 @@ class ProviderAdapter(ABC):
     display_name: str = ""
     provider_class: str = ""  # "A", "B", or "C"
 
+    # Automation level: "full_auto", "partial_auto", or "manual"
+    automation_level: str = "manual"
+
     # Whether this provider supports fully automated job execution
     supports_auto: bool = False
 

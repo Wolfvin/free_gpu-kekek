@@ -51,6 +51,7 @@ class DeepnoteAdapter(ProviderAdapter):
     provider_key: str = "deepnote"
     display_name: str = "Deepnote"
     provider_class: str = "B"
+    automation_level: str = "manual"
     supports_auto: bool = False
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu",

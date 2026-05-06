@@ -195,6 +195,7 @@ class GoogleColabAdapter(ProviderAdapter):
     provider_key: str = "google_colab"
     display_name: str = "Google Colab"
     provider_class: str = "B"
+    automation_level: str = "manual"
     supports_auto: bool = False
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu", "medium_gpu",

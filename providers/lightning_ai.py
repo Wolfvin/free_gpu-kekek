@@ -42,6 +42,7 @@ class LightningAIAdapter(ProviderAdapter):
     provider_key: str = "lightning_ai"
     display_name: str = "Lightning AI"
     provider_class: str = "A"
+    automation_level: str = "partial_auto"
     supports_auto: bool = True
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu", "medium_gpu",

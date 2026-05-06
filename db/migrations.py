@@ -222,6 +222,32 @@ MIGRATIONS = [
             last_used_at TEXT
         );
     """),
+
+    ("010_provider_automation_level", """
+        -- Add automation_level column to providers table
+        ALTER TABLE providers ADD COLUMN automation_level TEXT NOT NULL DEFAULT 'manual';
+
+        -- Update existing providers based on class and capabilities
+        -- Class A: full_auto (API/SSH automated)
+        UPDATE providers SET automation_level = 'full_auto'
+            WHERE key IN ('oracle_cloud', 'gcp');
+
+        -- Class A: partial_auto (some API but needs confirm)
+        UPDATE providers SET automation_level = 'partial_auto'
+            WHERE key IN ('paperspace', 'lightning_ai', 'codesphere');
+
+        -- Class B: partial_auto (has API)
+        UPDATE providers SET automation_level = 'partial_auto'
+            WHERE key = 'kaggle';
+
+        -- Class B: manual (notebook-based, user must start)
+        UPDATE providers SET automation_level = 'manual'
+            WHERE key IN ('google_colab', 'sagemaker', 'deepnote');
+
+        -- Class C: manual
+        UPDATE providers SET automation_level = 'manual'
+            WHERE key IN ('huggingface', 'intel_devcloud', 'nvidia_vgpu');
+    """),
 ]
 
 
@@ -245,6 +271,7 @@ PROVIDER_SEEDS = [
         "key": "google_colab",
         "display_name": "Google Colab",
         "provider_class": "B",
+        "automation_level": "manual",
         "default_session_limit_minutes": 720,
         "default_cooldown_minutes": 5,
     },
@@ -252,6 +279,7 @@ PROVIDER_SEEDS = [
         "key": "kaggle",
         "display_name": "Kaggle Notebooks",
         "provider_class": "B",
+        "automation_level": "partial_auto",
         "default_session_limit_minutes": 540,
         "default_cooldown_minutes": 5,
     },
@@ -259,6 +287,7 @@ PROVIDER_SEEDS = [
         "key": "huggingface",
         "display_name": "HuggingFace Spaces",
         "provider_class": "C",
+        "automation_level": "manual",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 10,
     },
@@ -266,6 +295,7 @@ PROVIDER_SEEDS = [
         "key": "paperspace",
         "display_name": "Paperspace Gradient",
         "provider_class": "A",
+        "automation_level": "partial_auto",
         "default_session_limit_minutes": 360,
         "default_cooldown_minutes": 10,
     },
@@ -273,6 +303,7 @@ PROVIDER_SEEDS = [
         "key": "sagemaker",
         "display_name": "Amazon SageMaker Studio Lab",
         "provider_class": "B",
+        "automation_level": "manual",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 10,
     },
@@ -280,6 +311,7 @@ PROVIDER_SEEDS = [
         "key": "lightning_ai",
         "display_name": "Lightning AI",
         "provider_class": "A",
+        "automation_level": "partial_auto",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 10,
     },
@@ -287,6 +319,7 @@ PROVIDER_SEEDS = [
         "key": "codesphere",
         "display_name": "Codesphere",
         "provider_class": "A",
+        "automation_level": "partial_auto",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 15,
     },
@@ -294,6 +327,7 @@ PROVIDER_SEEDS = [
         "key": "oracle_cloud",
         "display_name": "Oracle Cloud Free Tier",
         "provider_class": "A",
+        "automation_level": "full_auto",
         "default_session_limit_minutes": 1440,
         "default_cooldown_minutes": 0,
     },
@@ -301,6 +335,7 @@ PROVIDER_SEEDS = [
         "key": "gcp",
         "display_name": "Google Cloud Platform",
         "provider_class": "A",
+        "automation_level": "full_auto",
         "default_session_limit_minutes": 480,
         "default_cooldown_minutes": 0,
     },
@@ -308,6 +343,7 @@ PROVIDER_SEEDS = [
         "key": "intel_devcloud",
         "display_name": "Intel Developer Cloud",
         "provider_class": "C",
+        "automation_level": "manual",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 15,
     },
@@ -315,6 +351,7 @@ PROVIDER_SEEDS = [
         "key": "deepnote",
         "display_name": "Deepnote",
         "provider_class": "B",
+        "automation_level": "manual",
         "default_session_limit_minutes": 240,
         "default_cooldown_minutes": 15,
     },
@@ -322,6 +359,7 @@ PROVIDER_SEEDS = [
         "key": "nvidia_vgpu",
         "display_name": "NVIDIA vGPU Trial",
         "provider_class": "C",
+        "automation_level": "manual",
         "default_session_limit_minutes": 480,
         "default_cooldown_minutes": 0,
     },
@@ -337,14 +375,15 @@ def seed_providers(conn: sqlite3.Connection):
     for p in PROVIDER_SEEDS:
         conn.execute("""
             INSERT OR IGNORE INTO providers
-                (key, display_name, provider_class, enabled, supports_gpu,
-                 supports_checkpoint, default_session_limit_minutes,
+                (key, display_name, provider_class, automation_level, enabled,
+                 supports_gpu, supports_checkpoint, default_session_limit_minutes,
                  default_cooldown_minutes, created_at, updated_at)
-            VALUES (?, ?, ?, 1, 1, 1, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?)
         """, (
             p["key"],
             p["display_name"],
             p["provider_class"],
+            p["automation_level"],
             p["default_session_limit_minutes"],
             p["default_cooldown_minutes"],
             now,

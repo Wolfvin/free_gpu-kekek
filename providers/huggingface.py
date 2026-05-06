@@ -219,6 +219,7 @@ class HuggingFaceAdapter(ProviderAdapter):
     provider_key: str = "huggingface"
     display_name: str = "HuggingFace Spaces"
     provider_class: str = "C"
+    automation_level: str = "manual"
     supports_auto: bool = False
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu",

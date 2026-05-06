@@ -58,6 +58,7 @@ class KaggleAdapter(ProviderAdapter):
     provider_key: str = "kaggle"
     display_name: str = "Kaggle Notebooks"
     provider_class: str = "B"
+    automation_level: str = "partial_auto"
     supports_auto: bool = True
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu", "medium_gpu",

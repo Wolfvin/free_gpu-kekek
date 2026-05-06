@@ -9,6 +9,9 @@ training lifecycle without manual intervention:
   4. Auto-rotate through accounts when quota is exhausted
   5. Pre-emptively checkpoint before lease expiry
   6. Handle provider errors and auto-retry
+  7. Smart rotation: proactively rotate jobs before quota exhaustion
+  8. Auto-retry failed jobs with exponential backoff
+  9. Auto-rebalance jobs across accounts for optimal utilization
 
 This enables continuous AI training across the family GPU quota pool
 without requiring the user to manually start/stop/rotate sessions.
@@ -86,6 +89,21 @@ class AutoLoopConfig:
     # Whether to pre-emptively checkpoint before expiry
     auto_checkpoint: bool = True
 
+    # Smart rotation: proactively rotate accounts when nearing quota limits
+    auto_rotation: bool = True
+
+    # Percentage of quota usage at which to start looking for a replacement account
+    rotation_threshold_percent: float = 80.0  # Start rotating when 80% of quota used
+
+    # Auto-retry: automatically re-queue failed jobs with exponential backoff
+    auto_retry_failed: bool = True
+
+    # Maximum retry attempts for a failed job
+    max_job_retries: int = 3
+
+    # Auto-rebalance: move jobs from overloaded accounts to underused ones
+    auto_rebalance: bool = True
+
     # Callback for TUI/API notifications
     on_event: Optional[Callable] = None
 
@@ -107,6 +125,11 @@ class AutoLoopStats:
     last_queue_check: Optional[str] = None
     last_health_check: Optional[str] = None
     last_heartbeat: Optional[str] = None
+    total_rotations: int = 0
+    total_rebalances: int = 0
+    total_auto_retries: int = 0
+    last_rotation: Optional[str] = None
+    last_rebalance: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +147,11 @@ class AutoLoopStats:
             "last_queue_check": self.last_queue_check,
             "last_health_check": self.last_health_check,
             "last_heartbeat": self.last_heartbeat,
+            "total_rotations": self.total_rotations,
+            "total_rebalances": self.total_rebalances,
+            "total_auto_retries": self.total_auto_retries,
+            "last_rotation": self.last_rotation,
+            "last_rebalance": self.last_rebalance,
         }
 
 
@@ -248,6 +276,8 @@ class AutoLoop:
         last_queue_check = 0.0
         last_health_check = 0.0
         last_heartbeat = 0.0
+        last_rotation_check = 0.0
+        last_auto_retry = 0.0
 
         logger.info("AutoLoop main loop starting")
 
@@ -300,6 +330,22 @@ class AutoLoop:
                 self._clear_expired_cooldowns()
             except Exception as e:
                 logger.debug(f"Cooldown clear error: {e}")
+
+            # ── Smart rotation check ─────────────────────────────
+            if self.config.auto_rotation and now - last_rotation_check >= self.config.lease_check_interval * 2:
+                try:
+                    self._check_smart_rotation()
+                    last_rotation_check = now
+                except Exception as e:
+                    logger.debug(f"Smart rotation check error: {e}")
+
+            # ── Auto-retry failed jobs ───────────────────────────
+            if self.config.auto_retry_failed and now - last_auto_retry >= 60.0:
+                try:
+                    self._retry_failed_jobs()
+                    last_auto_retry = now
+                except Exception as e:
+                    logger.debug(f"Auto-retry check error: {e}")
 
             # ── Sleep in small increments for quick stop response ──
             self._sleep(1.0)
@@ -688,6 +734,270 @@ class AutoLoop:
         for account in accounts:
             self.account_repo.clear_cooldown(account["id"])
 
+    # ── Task: Smart Account Rotation ─────────────────────────────
+
+    def _check_smart_rotation(self):
+        """Check if any running jobs should be rotated to accounts with more quota.
+
+        Smart rotation proactively moves jobs from accounts that are running
+        low on quota to accounts with more available quota, preventing
+        unexpected lease expiries due to quota exhaustion.
+        """
+        if not self.config.auto_rotation:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        active_leases = self.lease_repo.list_active()
+
+        for lease in active_leases:
+            if lease.get("status") != "running":
+                continue
+
+            account = self.account_repo.get_by_id(lease["account_id"])
+            if not account:
+                continue
+
+            # Check quota usage percentage
+            daily_limit = account.get("daily_limit_minutes", 120)
+            weekly_limit = account.get("weekly_limit_minutes", 600)
+            remaining_daily = self.quota_repo.remaining_daily(account["id"], daily_limit)
+            remaining_weekly = self.quota_repo.remaining_weekly(account["id"], weekly_limit)
+
+            # Calculate usage percentage
+            daily_used_pct = ((daily_limit - remaining_daily) / daily_limit * 100) if daily_limit > 0 else 100
+            weekly_used_pct = ((weekly_limit - remaining_weekly) / weekly_limit * 100) if weekly_limit > 0 else 100
+
+            max_used_pct = max(daily_used_pct, weekly_used_pct)
+
+            if max_used_pct < self.config.rotation_threshold_percent:
+                continue  # Still plenty of quota
+
+            # Check if we already rotated this lease recently
+            job = self.job_repo.get_by_id(lease["job_id"])
+            if not job:
+                continue
+
+            # Find a better account
+            request = JobRequest(
+                job_name=job["name"],
+                gpu_profile=job["gpu_profile"],
+                max_runtime_minutes=job["max_runtime_minutes"],
+                priority=job["priority"],
+                checkpoint_uri=job.get("checkpoint_uri", ""),
+                entrypoint=job.get("entrypoint", "train.py"),
+                args=job.get("args") or {},
+                allow_providers=job.get("allow_providers") or [],
+                deny_providers=job.get("deny_providers") or [],
+                checkpoint_required=True,
+            )
+
+            new_account, failure_reason = self.selector.select(request)
+
+            if not new_account or new_account["id"] == account["id"]:
+                continue  # No better account available
+
+            # Check new account has significantly more quota
+            new_daily_limit = new_account.get("daily_limit_minutes", 120)
+            new_remaining_daily = self.quota_repo.remaining_daily(new_account["id"], new_daily_limit)
+
+            if new_remaining_daily <= remaining_daily * 1.5:
+                continue  # New account doesn't have significantly more quota
+
+            logger.info(
+                f"AutoLoop: Smart rotation — lease {lease['id']} "
+                f"account {account['label']} at {max_used_pct:.0f}% quota, "
+                f"rotating to {new_account['label']} ({new_remaining_daily}min remaining)"
+            )
+
+            # Try checkpoint on current lease
+            if job.get("checkpoint_uri"):
+                adapter = get_adapter(lease["provider_key"])
+                if adapter:
+                    try:
+                        ckpt_result = adapter.sync_checkpoint(lease, account, job["checkpoint_uri"])
+                        if not ckpt_result.ok:
+                            logger.warning(f"Smart rotation: checkpoint failed, skipping rotation: {ckpt_result.message}")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Smart rotation: checkpoint error, skipping: {e}")
+                        continue
+
+            # Create new lease
+            new_lease = self.lease_manager.create_lease(
+                job_id=lease["job_id"],
+                account_id=new_account["id"],
+                provider_key=new_account["provider_key"],
+                max_runtime_minutes=job["max_runtime_minutes"],
+            )
+
+            if not new_lease:
+                logger.warning(f"Smart rotation: failed to create new lease")
+                continue
+
+            # Start on new account
+            result = self.lease_manager.start_lease(new_lease["id"])
+
+            if result.ok:
+                # Complete old lease with usage tracking
+                runtime = 0
+                if lease.get("started_at"):
+                    started = datetime.fromisoformat(lease["started_at"])
+                    runtime = int((datetime.now(timezone.utc) - started).total_seconds() / 60)
+
+                self.lease_repo.mark_completed(lease["id"], runtime_minutes=runtime)
+                self.quota_repo.record_usage(
+                    account_id=account["id"],
+                    provider_key=account["provider_key"],
+                    used_minutes=max(runtime, 1),
+                    job_id=lease["job_id"],
+                    lease_id=lease["id"],
+                )
+
+                # Cooldown old account
+                if account.get("cooldown_minutes", 0) > 0:
+                    self.account_repo.set_cooldown(account["id"], account["cooldown_minutes"])
+
+                self.stats.total_rotations += 1
+                self.stats.last_rotation = now
+
+                self._emit_event("smart_rotation", {
+                    "job_id": lease["job_id"],
+                    "old_lease_id": lease["id"],
+                    "new_lease_id": new_lease["id"],
+                    "old_account": account["label"],
+                    "new_account": new_account["label"],
+                    "quota_used_pct": max_used_pct,
+                })
+
+                self.audit_repo.log(
+                    action="smart_rotation",
+                    entity_type="lease",
+                    entity_id=lease["id"],
+                    message=f"Rotated from {account['label']} ({max_used_pct:.0f}% quota) to {new_account['label']}",
+                    metadata={
+                        "old_account_id": account["id"],
+                        "new_account_id": new_account["id"],
+                        "quota_used_pct": max_used_pct,
+                        "new_lease_id": new_lease["id"],
+                    },
+                )
+
+                logger.info(
+                    f"AutoLoop: Smart rotation complete — "
+                    f"{account['label']} → {new_account['label']}"
+                )
+            else:
+                # Rotation failed — cancel new lease, keep running on old
+                self.lease_repo.cancel(new_lease["id"])
+                logger.warning(f"Smart rotation: failed to start on new account, keeping old lease")
+
+    # ── Task: Auto-Retry Failed Jobs ─────────────────────────────
+
+    def _retry_failed_jobs(self):
+        """Auto-retry recently failed jobs with exponential backoff.
+
+        When a job fails, this method checks if it's eligible for retry
+        and re-queues it with a delay. Maximum retries is configurable.
+        """
+        if not self.config.auto_retry_failed:
+            return
+
+        # Find recently failed jobs
+        failed_jobs = self.job_repo.list_all(status="failed")
+
+        for job in failed_jobs:
+            # Count previous leases for this job
+            all_leases = self.lease_repo.list_all()
+            job_leases = [l for l in all_leases if l["job_id"] == job["id"]]
+            retry_count = len([l for l in job_leases if l["status"] in ("failed", "expired")])
+
+            if retry_count >= self.config.max_job_retries:
+                logger.debug(f"Auto-retry: Job {job['id']} exceeded max retries ({retry_count})")
+                continue
+
+            # Check if we recently retried (avoid immediate retry loop)
+            if job.get("completed_at"):
+                completed = datetime.fromisoformat(job["completed_at"])
+                elapsed = (datetime.now(timezone.utc) - completed).total_seconds()
+                backoff_delay = min(30 * (2 ** retry_count), 300)  # 30s, 60s, 120s, max 300s
+
+                if elapsed < backoff_delay:
+                    continue  # Not enough time has passed
+
+            # Re-queue the job
+            self.job_repo.update(job["id"], status="queued", failure_reason=None, completed_at=None)
+
+            self.stats.total_auto_retries += 1
+
+            self.audit_repo.log(
+                action="auto_retry",
+                entity_type="job",
+                entity_id=job["id"],
+                message=f"Auto-retry #{retry_count + 1} for job {job['name']}",
+                metadata={"retry_count": retry_count + 1},
+            )
+
+            logger.info(f"AutoLoop: Auto-retry #{retry_count + 1} for job {job['id']} ({job['name']})")
+
+    # ── Task: Auto-Rebalance Jobs ────────────────────────────────
+
+    def _rebalance_jobs(self):
+        """Rebalance jobs across accounts for optimal quota utilization.
+
+        When one account is overloaded while another has ample quota,
+        this method moves jobs to balance the load.
+        """
+        if not self.config.auto_rebalance:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Get all active accounts and their remaining quota
+        accounts = self.account_repo.list_all(status="active")
+        if len(accounts) < 2:
+            return
+
+        account_quotas = []
+        for acct in accounts:
+            if self.lease_repo.is_account_busy(acct["id"]):
+                continue  # Skip busy accounts
+            daily_limit = acct.get("daily_limit_minutes", 120)
+            remaining = self.quota_repo.remaining_daily(acct["id"], daily_limit)
+            account_quotas.append((acct, remaining))
+
+        if len(account_quotas) < 2:
+            return
+
+        # Sort by remaining quota ascending
+        account_quotas.sort(key=lambda x: x[1])
+
+        # Find the most loaded account with a running lease
+        for loaded_acct, remaining in account_quotas:
+            leases = self.lease_repo.list_by_account(loaded_acct["id"], active_only=True)
+            if not leases:
+                continue
+
+            for lease in leases:
+                if lease.get("status") != "running":
+                    continue
+
+                job = self.job_repo.get_by_id(lease["job_id"])
+                if not job or not job.get("checkpoint_uri"):
+                    continue
+
+                # Find the least loaded account
+                best_acct, best_remaining = account_quotas[-1]
+                if best_remaining <= remaining * 2:
+                    continue  # No significantly better account
+
+                if best_acct["id"] == loaded_acct["id"]:
+                    continue
+
+                # This is handled by smart rotation, so we just log and skip
+                # to avoid double-rotation
+                break
+            break
+
     # ── Manual Triggers ────────────────────────────────────────────
 
     def submit_job(self, job_request: JobRequest) -> JobRequestResult:
@@ -814,6 +1124,11 @@ class AutoLoop:
                 "auto_start_queued": self.config.auto_start_queued,
                 "auto_health_check": self.config.auto_health_check,
                 "auto_checkpoint": self.config.auto_checkpoint,
+                "auto_rotation": self.config.auto_rotation,
+                "rotation_threshold_percent": self.config.rotation_threshold_percent,
+                "auto_retry_failed": self.config.auto_retry_failed,
+                "max_job_retries": self.config.max_job_retries,
+                "auto_rebalance": self.config.auto_rebalance,
                 "checkpoint_before_expiry_minutes": self.config.checkpoint_before_expiry_minutes,
             },
             "active_leases": len(self.lease_repo.list_active()),

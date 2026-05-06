@@ -29,6 +29,7 @@ def calculate_score(
       - Remaining weekly quota — more remaining = better
       - Health status — "ok" gets bonus, "error" gets penalty
       - Provider supports auto — AUTO gets bonus for agent-friendliness
+      - Automation level — full_auto gets bonus, manual gets none
       - Recent errors — penalty for accounts with recent failures
       - Job priority — high priority jobs get extra weight from high-priority accounts
 
@@ -38,7 +39,7 @@ def calculate_score(
         remaining_daily_minutes: Daily quota remaining
         remaining_weekly_minutes: Weekly quota remaining
         health_status: "ok", "degraded", "down", or "unknown"
-        provider_adapter_info: Dict with supports_auto, provider_class
+        provider_adapter_info: Dict with supports_auto, provider_class, automation_level
 
     Returns:
         Float score (higher = better match)
@@ -74,21 +75,26 @@ def calculate_score(
     class_bonus = {"A": 10, "B": 5, "C": 0}
     score += class_bonus.get(provider_class, 0)
 
-    # 7. Recent error penalty
+    # 7. Automation level bonus
+    automation_level = provider_adapter_info.get("automation_level", "manual")
+    auto_bonus = {"full_auto": 20, "partial_auto": 10, "manual": 0}
+    score += auto_bonus.get(automation_level, 0)
+
+    # 8. Recent error penalty
     if account.get("last_error_at"):
         score -= 10
 
-    # 8. Job priority interaction
+    # 9. Job priority interaction
     job_priority = job_request.get("priority", "normal")
     if job_priority == "high":
         score += priority * 5  # High priority jobs get extra from high-priority accounts
 
-    # 9. Long-running preference for provider_class A
+    # 10. Long-running preference for provider_class A
     gpu_profile = job_request.get("gpu_profile", "small_gpu")
     if gpu_profile == "long_running" and provider_class == "A":
         score += 15  # Class A providers are better for long-running
 
-    # 10. Penalize if remaining quota barely covers the job
+    # 11. Penalize if remaining quota barely covers the job
     max_runtime = job_request.get("max_runtime_minutes", 180)
     if remaining_daily_minutes < max_runtime * 1.5:
         score -= 5  # Tight fit — might not have buffer

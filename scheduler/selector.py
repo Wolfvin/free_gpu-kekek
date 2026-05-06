@@ -103,6 +103,7 @@ class AccountSelector:
                 provider_adapter_info={
                     "supports_auto": adapter.supports_auto,
                     "provider_class": adapter.provider_class,
+                    "automation_level": adapter.automation_level,
                 },
             )
 

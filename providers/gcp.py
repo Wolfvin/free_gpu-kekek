@@ -40,6 +40,7 @@ class GCPAdapter(ProviderAdapter):
     provider_key: str = "gcp"
     display_name: str = "Google Cloud Platform"
     provider_class: str = "A"
+    automation_level: str = "full_auto"
     supports_auto: bool = True
     supported_profiles: list[str] = [
         "cpu_only", "small_gpu", "medium_gpu", "high_vram_gpu",

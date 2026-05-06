@@ -352,7 +352,7 @@ PLATFORM_DEFS: dict[str, dict] = {
 }
 
 
-def build_platform(key: str, cfg: dict, config_dir: str = ".") -> PlatformConfig:
+def build_platform(key: str, cfg: dict, config_dir: str = None) -> PlatformConfig:
     """Build a PlatformConfig from YAML config + platform definition.
 
     Credentials are decrypted from storage (keyring/Fernet) before use.
