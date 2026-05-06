@@ -27,7 +27,7 @@ from platforms import (
     PLATFORM_DEFS, CREDENTIAL_SCHEMAS,
 )
 from session import Session, SessionManager
-from vault import encrypt_credentials, decrypt_credentials, delete_credentials, get_storage_mode
+from vault import encrypt_credentials, delete_credentials, get_storage_mode
 from handlers import validate_account_name
 
 import time
